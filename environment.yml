@@ -1,0 +1,9 @@
+name: sim-wildfire-marl
+channels:
+  - defaults
+dependencies:
+  - python>=3.10
+  - numpy
+  - matplotlib
+  - pip:
+    - pillow

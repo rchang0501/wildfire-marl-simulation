@@ -1,27 +1,18 @@
 import numpy as np
+
 from algorithms.sharing_algorithms.algorithm_base import SharingAlgorithm
-
-
-def manhattan_distance(r1: int, c1: int, r2: int, c2: int) -> int:
-    return abs(r2 - r1) + abs(c2 - c1)
-
-
-def step_toward(cur_r: int, cur_c: int, tgt_r: int, tgt_c: int, m: int) -> tuple[int, int]:
-    dr = tgt_r - cur_r
-    dc = tgt_c - cur_c
-
-    dx = int(np.clip(dc, -m, m))
-    rem = m - abs(dx)
-    dy = int(np.clip(dr, -rem, rem))
-    return dx, dy
+from algorithms.utils import step_toward
 
 
 class PeriodicTransferSharingAlgorithm(SharingAlgorithm):
-    """
-    Every s steps, select the best (least burning) and worst (most burning)
+    """Every s steps, select the best (least burning) and worst (most burning)
     jurisdictions, then move one unit from the best to the worst. If they are
-    not adjacent, the unit is routed hop-by-hop through adjacent jurisdictions
-    and remains under this algorithm's control until it reaches the destination.
+    not adjacent, the unit is routed hop-by-hop through adjacent jurisdictions.
+
+    Three-phase state machine:
+    1. Select: pick worst/best jurisdictions, choose unit closest to center in best
+    2. Steer: return steering (dx, dy) to move unit toward center
+    3. Hop: once at center, return (unit_id, next_hop) transfer; repeat for multi-hop
     """
 
     name = "periodic_transfer"
@@ -36,97 +27,126 @@ class PeriodicTransferSharingAlgorithm(SharingAlgorithm):
             self.total_steps = int(self.total_steps)
         self.disabled = self.total_steps is not None and self.period_s > self.total_steps
         self.cooldown = 0
-        self.active_unit_idx: int | None = None
+        self.active_unit_id: int | None = None
         self.active_target_juris: int | None = None
 
-    def assignments(self, env, rng: np.random.Generator) -> tuple[np.ndarray, np.ndarray]:
-        assigned_mask = np.zeros((env.num_units_total,), dtype=bool)
-        actions = self._default_actions(env)
-
+    def decide_transfers(self, multi_env, rng) -> list[tuple[int, int]]:
         if self.disabled:
-            return assigned_mask, actions
+            return []
+
+        if self.active_unit_id is None:
+            return []
+
+        uid = self.active_unit_id
+        cur_j = int(multi_env.unit_jurisdiction[uid])
+
+        # Unit is in transit -- nothing to do
+        if cur_j < 0:
+            return []
+
+        jenv = multi_env.jurisdictions[cur_j]
+        local_idx = int(multi_env.unit_local_index[uid])
+        cur_cell = int(jenv.unit_positions[local_idx])
+
+        # Not at center yet -- steering will handle it
+        if cur_cell != jenv.center_cell:
+            return []
+
+        tgt_j = self.active_target_juris
+
+        # Already at destination
+        if cur_j == tgt_j:
+            self.active_unit_id = None
+            self.active_target_juris = None
+            self.cooldown = self.period_s
+            return []
+
+        # Compute next hop toward target
+        cur_r = int(multi_env.juris_row[cur_j])
+        cur_c = int(multi_env.juris_col[cur_j])
+        tgt_r = int(multi_env.juris_row[tgt_j])
+        tgt_c = int(multi_env.juris_col[tgt_j])
+        dr = tgt_r - cur_r
+        dc = tgt_c - cur_c
+
+        if abs(dr) + abs(dc) == 1:
+            next_j = tgt_j
+        else:
+            step_r = 0 if dr == 0 else (1 if dr > 0 else -1)
+            step_c = 0 if dc == 0 else (1 if dc > 0 else -1)
+            if step_r != 0:
+                next_j = cur_j + step_r * multi_env.num_juris_cols
+            else:
+                next_j = cur_j + step_c
+
+        return [(uid, next_j)]
+
+    def get_steering_actions(self, multi_env, rng) -> dict[int, tuple[int, int]]:
+        if self.disabled:
+            return {}
 
         if self.cooldown > 0:
             self.cooldown -= 1
-            return assigned_mask, actions
+            return {}
 
-        if self.active_unit_idx is None:
-            burning_counts = np.sum(env.burning_map, axis=(1, 2)).astype(int)
+        # Phase 1: Select unit if none active
+        if self.active_unit_id is None:
+            burning_counts = np.array(multi_env.burning_counts, dtype=int)
             worst_juris = int(np.argmax(burning_counts))
             best_juris = int(np.argmin(burning_counts))
 
             if worst_juris == best_juris:
-                return assigned_mask, actions
-
+                return {}
             if burning_counts[worst_juris] <= burning_counts[best_juris]:
-                return assigned_mask, actions
+                return {}
 
             source_juris = best_juris
             target_juris = worst_juris
 
-            unit_indices = np.nonzero(env.unit_positions[:, 0] == source_juris)[0]
-            if unit_indices.size == 0:
-                return assigned_mask, actions
+            jenv = multi_env.jurisdictions[source_juris]
+            if jenv.num_units == 0:
+                return {}
 
-            cells = env.unit_positions[unit_indices, 1].astype(int)
-            mask = cells >= 0
-            if not np.any(mask):
-                return assigned_mask, actions
+            # Find global unit IDs in source jurisdiction
+            global_mask = multi_env.unit_jurisdiction == source_juris
+            global_ids = np.nonzero(global_mask)[0]
+            if global_ids.size == 0:
+                return {}
 
-            unit_indices = unit_indices[mask]
-            cells = cells[mask]
-
-            cur_rs = env.per_juris_cell_row[cells]
-            cur_cs = env.per_juris_cell_col[cells]
-            dists = np.abs(cur_rs - env.center_cell_row) + np.abs(cur_cs - env.center_cell_col)
-            self.active_unit_idx = int(unit_indices[np.argmin(dists)])
+            # Find the one closest to center
+            local_indices = multi_env.unit_local_index[global_ids]
+            cells = jenv.unit_positions[local_indices]
+            cur_rs = jenv.cell_row[cells]
+            cur_cs = jenv.cell_col[cells]
+            dists = np.abs(cur_rs - jenv.center_cell_row) + np.abs(cur_cs - jenv.center_cell_col)
+            best_idx = int(np.argmin(dists))
+            self.active_unit_id = int(global_ids[best_idx])
             self.active_target_juris = int(target_juris)
 
-        if self.active_unit_idx is None or self.active_target_juris is None:
-            return assigned_mask, actions
+        if self.active_unit_id is None:
+            return {}
 
-        chosen_idx = self.active_unit_idx
-        chosen_cell = int(env.unit_positions[chosen_idx, 1])
+        uid = self.active_unit_id
+        cur_j = int(multi_env.unit_jurisdiction[uid])
 
-        if chosen_cell < 0:
-            assigned_mask[chosen_idx] = True
-            return assigned_mask, actions
+        # In transit -- no steering needed
+        if cur_j < 0:
+            return {}
 
-        if chosen_cell == env.center_cell_index:
-            cur_j = int(env.unit_positions[chosen_idx, 0])
-            tgt_j = int(self.active_target_juris)
-            if cur_j != tgt_j:
-                cur_r = int(env.juris_row[cur_j])
-                cur_c = int(env.juris_col[cur_j])
-                tgt_r = int(env.juris_row[tgt_j])
-                tgt_c = int(env.juris_col[tgt_j])
-                dr = tgt_r - cur_r
-                dc = tgt_c - cur_c
+        jenv = multi_env.jurisdictions[cur_j]
+        local_idx = int(multi_env.unit_local_index[uid])
+        cur_cell = int(jenv.unit_positions[local_idx])
 
-                if abs(dr) + abs(dc) == 1:
-                    next_j = tgt_j
-                else:
-                    step_r = 0 if dr == 0 else (1 if dr > 0 else -1)
-                    step_c = 0 if dc == 0 else (1 if dc > 0 else -1)
-                    if step_r != 0:
-                        next_j = cur_j + step_r * env.num_juris_cols
-                    else:
-                        next_j = cur_j + step_c
+        # At center -- transfer will be handled by decide_transfers
+        if cur_cell == jenv.center_cell:
+            return {}
 
-                actions[chosen_idx] = (1, int(next_j), 0)
-                assigned_mask[chosen_idx] = True
-                return assigned_mask, actions
-
-            actions[chosen_idx] = (2, 0, 0)
-            assigned_mask[chosen_idx] = True
-            self.active_unit_idx = None
-            self.active_target_juris = None
-            self.cooldown = self.period_s
-            return assigned_mask, actions
-
-        cur_r = int(env.per_juris_cell_row[chosen_cell])
-        cur_c = int(env.per_juris_cell_col[chosen_cell])
-        dx, dy = step_toward(cur_r, cur_c, env.center_cell_row, env.center_cell_col, env.movement_per_step)
-        actions[chosen_idx] = (0, int(dx), int(dy))
-        assigned_mask[chosen_idx] = True
-        return assigned_mask, actions
+        # Steer toward center
+        cur_r = int(jenv.cell_row[cur_cell])
+        cur_c = int(jenv.cell_col[cur_cell])
+        dx, dy = step_toward(
+            cur_r, cur_c,
+            jenv.center_cell_row, jenv.center_cell_col,
+            jenv.movement_per_step,
+        )
+        return {uid: (dx, dy)}

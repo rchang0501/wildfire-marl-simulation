@@ -1,0 +1,31 @@
+# Operating System
+.DS_Store
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.Python
+env/
+venv/
+lib/
+lib64/
+Python.Framework/
+bin/
+include/
+share/
+
+# Editors
+.vscode/
+.idea/
+
+# Logs and databases
+*.log
+*.sqlite3
+*.db
+
+# Simulation outputs
+snapshots/
+results/
+animations/

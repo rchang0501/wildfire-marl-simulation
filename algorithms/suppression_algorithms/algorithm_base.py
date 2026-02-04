@@ -3,11 +3,13 @@ import os
 from abc import ABC, abstractmethod
 import numpy as np
 
+from environment.jurisdiction_env import JurisdictionEnv
+
 
 class SuppressionAlgorithm(ABC):
-    """
-    Superclass for suppression algorithms.
-    Algorithms decide actions for units not already assigned by sharing.
+    """Superclass for suppression algorithms.
+
+    Operates on a single JurisdictionEnv. Returns (num_units, 2) array of (dx, dy).
     """
 
     def __init__(self, param_dir: str | None = None, params: dict | None = None):
@@ -28,42 +30,13 @@ class SuppressionAlgorithm(ABC):
         return {}
 
     @abstractmethod
-    def actions(
-        self,
-        env,
-        rng: np.random.Generator,
-        assigned_mask: np.ndarray,
-        assigned_actions: np.ndarray,
-    ) -> np.ndarray:
-        """
-        Return actions array of shape (N,3) with entries (tag,a,b).
-        The suppression algorithm should only decide actions for units
-        where assigned_mask is False.
-        """
+    def actions(self, jenv: JurisdictionEnv, rng: np.random.Generator) -> np.ndarray:
+        """Return (jenv.num_units, 2) array of (dx, dy)."""
         raise NotImplementedError()
 
-    def get_actions(
-        self,
-        env,
-        rng: np.random.Generator,
-        assigned_mask: np.ndarray,
-        assigned_actions: np.ndarray,
-    ) -> np.ndarray:
-        actions = np.asarray(self.actions(env, rng, assigned_mask, assigned_actions), dtype=int)
-        expected_shape = (env.num_units_total, 3)
+    def get_actions(self, jenv: JurisdictionEnv, rng: np.random.Generator) -> np.ndarray:
+        actions = np.asarray(self.actions(jenv, rng), dtype=int)
+        expected_shape = (jenv.num_units, 2)
         if actions.shape != expected_shape:
             raise ValueError(f"actions shape {actions.shape} != {expected_shape}")
-
-        actions[assigned_mask] = assigned_actions[assigned_mask]
-
-        tags = actions[:, 0]
-        in_transit = env.unit_positions[:, 1] < 0
-        valid_tags = np.isin(tags, [0, 1, 2])
-        if not np.all(valid_tags[~in_transit]):
-            raise ValueError("Invalid action tag for a unit not in transit.")
-        return actions
-
-    def _default_actions(self, env) -> np.ndarray:
-        actions = np.zeros((env.num_units_total, 3), dtype=int)
-        actions[:, 0] = 2  # stay by default
         return actions
