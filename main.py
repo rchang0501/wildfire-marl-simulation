@@ -216,6 +216,21 @@ def run_multi(
 
     rng_lightning, rng_spread, rng_algo = build_rngs(lightning_seed, spread_seed)
 
+    # Per-step metric collection
+    metrics = {
+        "burning_per_juris": [],
+        "total_burning": [],
+        "units_per_juris": [],
+        "units_in_transit": [],
+        "rewards_per_juris": [],
+    }
+    # Record step 0 (initial state)
+    metrics["burning_per_juris"].append(multi_env.burning_counts)
+    metrics["total_burning"].append(multi_env.total_burning)
+    metrics["units_per_juris"].append(multi_env.unit_count_per_juris)
+    metrics["units_in_transit"].append(multi_env.num_transit_units)
+    metrics["rewards_per_juris"].append([0.0] * multi_env.num_juris)
+
     if save_snapshots:
         burn_snap = np.zeros(
             (steps + 1, multi_env.num_juris, per_juris_rows, per_juris_cols), dtype=bool
@@ -265,6 +280,13 @@ def run_multi(
             rng_spread=rng_spread,
             rng_lightning=rng_lightning,
         )
+
+        # Record metrics for this step
+        metrics["burning_per_juris"].append(multi_env.burning_counts)
+        metrics["total_burning"].append(multi_env.total_burning)
+        metrics["units_per_juris"].append(multi_env.unit_count_per_juris)
+        metrics["units_in_transit"].append(multi_env.num_transit_units)
+        metrics["rewards_per_juris"].append([float(r) for r in rewards])
 
         if save_snapshots:
             burning_t, positions_t = multi_env.get_snapshot()
@@ -318,6 +340,8 @@ def run_multi(
             "lightning_sigma_log": multi_env.lightning_sigma_log,
         }
         meta_file.write_text(json.dumps(metadata, indent=2), encoding="utf-8")
+
+    return metrics
 
 
 # ======================================================================
