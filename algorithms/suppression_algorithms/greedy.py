@@ -1,124 +1,98 @@
 import numpy as np
+
 from algorithms.suppression_algorithms.algorithm_base import SuppressionAlgorithm
+from algorithms.utils import manhattan_distance, step_toward
+from environment.jurisdiction_env import JurisdictionEnv
 
 
-def manhattan_distance(r1: int, c1: int, r2: int, c2: int) -> int:
-    return abs(r2 - r1) + abs(c2 - c1)
+def greedy(jenv: JurisdictionEnv) -> np.ndarray:
+    """Greedy suppression for a single jurisdiction.
 
+    For every unit (sorted by current cell index), pick the closest burning cell
+    (Manhattan distance). If it can step onto the fire this turn, do so; else
+    take the biggest step toward it. After assigning a target, that cell is
+    removed from candidates for other units this step.
 
-def step_toward(cur_r: int, cur_c: int, tgt_r: int, tgt_c: int, m: int) -> tuple[int, int]:
-    dr = tgt_r - cur_r
-    dc = tgt_c - cur_c
+    Returns:
+        actions: (num_units, 2) int array of (dx, dy)
+    """
+    n = jenv.num_units
+    C = jenv.cols
+    m = int(jenv.movement_per_step)
 
-    dx = int(np.clip(dc, -m, m))
-    rem = m - abs(dx)
-    dy = int(np.clip(dr, -rem, rem))
-    return dx, dy
+    actions = np.zeros((n, 2), dtype=int)
 
-
-def greedy(env) -> np.ndarray:
-        """
-        Greedy suppression. For each jurisdiction:
-            - For every unit (sorted by current flattened cell index),
-                pick the closest burning cell (Manhattan distance).
-            - If it can step onto the fire this turn, do so; else take the biggest step toward it.
-            - After assigning a target to a unit, that burning cell is considered "claimed" and is
-                removed from candidates for other units this step.
-
-        Returns:
-            actions: (N,3) int array of (tag,a,b)
-                tag=0 move by (dx,dy)=(a,b)
-                tag=2 stay
-        """
-        J = env.num_juris
-        C = env.per_juris_cols
-        m = int(env.movement_per_step)
-
-        actions = np.zeros((env.num_units_total, 3), dtype=int)
-        actions[:, 0] = 2  # default: stay
-
-        for j in range(J):
-            burning_rc = np.argwhere(env.burning_map[j])  # (K,2)
-            if burning_rc.size == 0:
-                continue
-
-            burning_flat = (burning_rc[:, 0] * C + burning_rc[:, 1]).astype(int)
-            available_targets = set(burning_flat.tolist())
-
-            unit_indices = np.nonzero(env.unit_positions[:, 0] == j)[0]
-            if unit_indices.size == 0:
-                continue
-
-            unit_cells = env.unit_positions[unit_indices, 1].astype(int)
-            unit_order = unit_indices[np.argsort(unit_cells, kind="stable")]
-
-            for u_idx in unit_order:
-                cur_cell = int(env.unit_positions[u_idx, 1])
-
-                if cur_cell < 0 or not available_targets:
-                    actions[u_idx] = (2, 0, 0)
-                    continue
-
-                cur_r = int(env.per_juris_cell_row[cur_cell])
-                cur_c = int(env.per_juris_cell_col[cur_cell])
-
-                best_tgt_flat = None
-                best_dist = None
-
-                for tgt_flat in available_targets:
-                    tgt_r = tgt_flat // C
-                    tgt_c = tgt_flat % C
-                    d = manhattan_distance(cur_r, cur_c, tgt_r, tgt_c)
-                    if best_dist is None or d < best_dist or (d == best_dist and tgt_flat < best_tgt_flat):
-                        best_dist = d
-                        best_tgt_flat = tgt_flat
-
-                available_targets.remove(best_tgt_flat)
-
-                tgt_r = best_tgt_flat // C
-                tgt_c = best_tgt_flat % C
-
-                if best_dist == 0:
-                    actions[u_idx] = (2, 0, 0)
-                elif best_dist <= m:
-                    dx = tgt_c - cur_c
-                    dy = tgt_r - cur_r
-                    actions[u_idx] = (0, int(dx), int(dy))
-                else:
-                    dx, dy = step_toward(cur_r, cur_c, tgt_r, tgt_c, m)
-                    actions[u_idx] = (0, int(dx), int(dy))
-
-        idle = (actions[:, 0] == 2)
-        not_in_transit = env.unit_positions[:, 1] >= 0
-        remaining = np.nonzero(idle & not_in_transit)[0]
-        for u_idx in remaining:
-            cur_cell = int(env.unit_positions[u_idx, 1])
-            if cur_cell < 0:
-                continue
-            cur_r = int(env.per_juris_cell_row[cur_cell])
-            cur_c = int(env.per_juris_cell_col[cur_cell])
-            dx, dy = step_toward(cur_r, cur_c, env.center_cell_row, env.center_cell_col, m)
-            if dx != 0 or dy != 0:
-                actions[u_idx] = (0, int(dx), int(dy))
-
+    burning_rc = np.argwhere(jenv.burning_map)  # (K, 2)
+    if burning_rc.size == 0:
+        # No fires: move idle units toward center
+        for i in range(n):
+            cur_cell = int(jenv.unit_positions[i])
+            cur_r = int(jenv.cell_row[cur_cell])
+            cur_c = int(jenv.cell_col[cur_cell])
+            dx, dy = step_toward(cur_r, cur_c, jenv.center_cell_row, jenv.center_cell_col, m)
+            actions[i] = (dx, dy)
         return actions
+
+    burning_flat = (burning_rc[:, 0] * C + burning_rc[:, 1]).astype(int)
+    available_targets = set(burning_flat.tolist())
+
+    # Sort units by cell index for deterministic ordering
+    unit_order = np.argsort(jenv.unit_positions, kind="stable")
+
+    for i in unit_order:
+        cur_cell = int(jenv.unit_positions[i])
+
+        if not available_targets:
+            # No targets left -- stay
+            continue
+
+        cur_r = int(jenv.cell_row[cur_cell])
+        cur_c = int(jenv.cell_col[cur_cell])
+
+        best_tgt_flat = None
+        best_dist = None
+
+        for tgt_flat in available_targets:
+            tgt_r = tgt_flat // C
+            tgt_c = tgt_flat % C
+            d = manhattan_distance(cur_r, cur_c, tgt_r, tgt_c)
+            if best_dist is None or d < best_dist or (d == best_dist and tgt_flat < best_tgt_flat):
+                best_dist = d
+                best_tgt_flat = tgt_flat
+
+        available_targets.remove(best_tgt_flat)
+
+        tgt_r = best_tgt_flat // C
+        tgt_c = best_tgt_flat % C
+
+        if best_dist == 0:
+            # Already on fire cell -- stay
+            continue
+        elif best_dist <= m:
+            dx = tgt_c - cur_c
+            dy = tgt_r - cur_r
+            actions[i] = (int(dx), int(dy))
+        else:
+            dx, dy = step_toward(cur_r, cur_c, tgt_r, tgt_c, m)
+            actions[i] = (int(dx), int(dy))
+
+    # Idle units (no fire target assigned) move toward center
+    for i in range(n):
+        if actions[i, 0] == 0 and actions[i, 1] == 0:
+            cur_cell = int(jenv.unit_positions[i])
+            cur_r = int(jenv.cell_row[cur_cell])
+            cur_c = int(jenv.cell_col[cur_cell])
+            dx, dy = step_toward(cur_r, cur_c, jenv.center_cell_row, jenv.center_cell_col, m)
+            if dx != 0 or dy != 0:
+                actions[i] = (int(dx), int(dy))
+
+    return actions
 
 
 class GreedyAlgorithm(SuppressionAlgorithm):
-    """
-    Greedy suppression heuristic.
-    """
+    """Greedy suppression heuristic."""
 
     name = "greedy"
 
-    def actions(
-        self,
-        env,
-        rng: np.random.Generator,
-        assigned_mask: np.ndarray,
-        assigned_actions: np.ndarray,
-    ) -> np.ndarray:
-        # Heuristic is deterministic and does not use rng.
-        actions = greedy(env)
-        actions[assigned_mask] = assigned_actions[assigned_mask]
-        return actions
+    def actions(self, jenv: JurisdictionEnv, rng: np.random.Generator) -> np.ndarray:
+        return greedy(jenv)
