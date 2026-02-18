@@ -1,7 +1,7 @@
 import numpy as np
 
 from algorithms.suppression_algorithms.algorithm_base import SuppressionAlgorithm
-from algorithms.utils import manhattan_distance, step_toward
+from algorithms.utils import manhattan_distance, must_return_to_base, step_toward
 from environment.jurisdiction_env import JurisdictionEnv
 
 
@@ -22,10 +22,21 @@ def greedy(jenv: JurisdictionEnv) -> np.ndarray:
 
     actions = np.zeros((n, 2), dtype=int)
 
+    # Fuel: units that must return to base get step_toward(center) immediately
+    returning = must_return_to_base(jenv)
+    for i in np.nonzero(returning)[0]:
+        cur_cell = int(jenv.unit_positions[i])
+        cur_r = int(jenv.cell_row[cur_cell])
+        cur_c = int(jenv.cell_col[cur_cell])
+        dx, dy = step_toward(cur_r, cur_c, jenv.center_cell_row, jenv.center_cell_col, m)
+        actions[i] = (dx, dy)
+
     burning_rc = np.argwhere(jenv.burning_map)  # (K, 2)
     if burning_rc.size == 0:
-        # No fires: move idle units toward center
+        # No fires: move idle (non-returning) units toward center
         for i in range(n):
+            if returning[i]:
+                continue
             cur_cell = int(jenv.unit_positions[i])
             cur_r = int(jenv.cell_row[cur_cell])
             cur_c = int(jenv.cell_col[cur_cell])
@@ -40,6 +51,9 @@ def greedy(jenv: JurisdictionEnv) -> np.ndarray:
     unit_order = np.argsort(jenv.unit_positions, kind="stable")
 
     for i in unit_order:
+        if returning[i]:
+            continue
+
         cur_cell = int(jenv.unit_positions[i])
 
         if not available_targets:
@@ -76,8 +90,10 @@ def greedy(jenv: JurisdictionEnv) -> np.ndarray:
             dx, dy = step_toward(cur_r, cur_c, tgt_r, tgt_c, m)
             actions[i] = (int(dx), int(dy))
 
-    # Idle units (no fire target assigned) move toward center
+    # Idle units (no fire target assigned) move toward center, skip returning
     for i in range(n):
+        if returning[i]:
+            continue
         if actions[i, 0] == 0 and actions[i, 1] == 0:
             cur_cell = int(jenv.unit_positions[i])
             cur_r = int(jenv.cell_row[cur_cell])

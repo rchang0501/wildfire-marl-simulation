@@ -61,6 +61,8 @@ def run_single(
     movement_per_step: int,
     lightning_mu_log: float,
     lightning_sigma_log: float,
+    max_fuel: int | None = None,
+    fuel_refuel_rate: int = 1,
 ):
     if suppression_algorithm_name not in SUPPRESSION_ALGORITHM_REGISTRY:
         raise ValueError(f"Unknown suppression algorithm: {suppression_algorithm_name}")
@@ -81,6 +83,8 @@ def run_single(
         lightning_mu_log=lightning_mu_log,
         lightning_sigma_log=lightning_sigma_log,
         num_units=num_units_per_juris,
+        max_fuel=max_fuel,
+        fuel_refuel_rate=fuel_refuel_rate,
     )
 
     rng_lightning, rng_spread, rng_algo = build_rngs(lightning_seed, spread_seed)
@@ -92,6 +96,11 @@ def run_single(
         burn_snap[0, 0] = jenv.burning_map
         unit_pos_snap[0, :, 0] = 0  # jurisdiction 0
         unit_pos_snap[0, :, 1] = jenv.unit_positions
+        if max_fuel is not None:
+            fuel_snap = np.zeros((steps + 1, num_units_per_juris), dtype=int)
+            fuel_snap[0] = jenv.unit_fuel
+        else:
+            fuel_snap = None
 
     if verbose:
         print(
@@ -102,12 +111,14 @@ def run_single(
 
     for step_idx in range(steps):
         actions = suppression_algo.get_actions(jenv, rng_algo)
-        _, _, reward, count = jenv.step(actions, rng_spread=rng_spread, rng_lightning=rng_lightning)
+        _, _, _, reward, count = jenv.step(actions, rng_spread=rng_spread, rng_lightning=rng_lightning)
 
         if save_snapshots:
             burn_snap[step_idx + 1, 0] = jenv.burning_map
             unit_pos_snap[step_idx + 1, :, 0] = 0
             unit_pos_snap[step_idx + 1, :, 1] = jenv.unit_positions
+            if fuel_snap is not None:
+                fuel_snap[step_idx + 1] = jenv.unit_fuel
 
         if verbose:
             print(
@@ -126,14 +137,16 @@ def run_single(
         out_file = output_path / (
             f"{run_label}__mode_single__suppression_{suppression_algorithm_name}.npz"
         )
-        np.savez_compressed(
-            out_file,
+        save_kwargs = dict(
             burning_map=burn_snap,
             unit_positions=unit_pos_snap,
             steps=steps,
             lightning_seed=lightning_seed,
             spread_seed=spread_seed,
         )
+        if fuel_snap is not None:
+            save_kwargs["unit_fuel"] = fuel_snap
+        np.savez_compressed(out_file, **save_kwargs)
         meta_file = out_file.with_name(f"{out_file.stem}__meta.json")
         metadata = {
             "run_label": run_label,
@@ -151,6 +164,8 @@ def run_single(
             "adj_matrix": [[0]],
             "lightning_mu_log": lightning_mu_log,
             "lightning_sigma_log": lightning_sigma_log,
+            "max_fuel": max_fuel,
+            "fuel_refuel_rate": fuel_refuel_rate,
         }
         meta_file.write_text(json.dumps(metadata, indent=2), encoding="utf-8")
 
@@ -184,6 +199,8 @@ def run_multi(
     juris_travel_time: int,
     lightning_mu_log: float,
     lightning_sigma_log: float,
+    max_fuel: int | None = None,
+    fuel_refuel_rate: int = 1,
 ):
     if sharing_algorithm_name not in SHARING_ALGORITHM_REGISTRY:
         raise ValueError(f"Unknown sharing algorithm: {sharing_algorithm_name}")
@@ -212,6 +229,8 @@ def run_multi(
         juris_travel_time=juris_travel_time,
         lightning_mu_log=lightning_mu_log,
         lightning_sigma_log=lightning_sigma_log,
+        max_fuel=max_fuel,
+        fuel_refuel_rate=fuel_refuel_rate,
     )
 
     rng_lightning, rng_spread, rng_algo = build_rngs(lightning_seed, spread_seed)
@@ -221,9 +240,14 @@ def run_multi(
             (steps + 1, multi_env.num_juris, per_juris_rows, per_juris_cols), dtype=bool
         )
         unit_pos_snap = np.zeros((steps + 1, multi_env.num_units_total, 2), dtype=int)
-        burning_0, positions_0 = multi_env.get_snapshot()
+        burning_0, positions_0, fuel_0 = multi_env.get_snapshot()
         burn_snap[0] = burning_0
         unit_pos_snap[0] = positions_0
+        if max_fuel is not None:
+            fuel_snap = np.zeros((steps + 1, multi_env.num_units_total), dtype=int)
+            fuel_snap[0] = fuel_0
+        else:
+            fuel_snap = None
 
     if verbose:
         print(
@@ -267,9 +291,11 @@ def run_multi(
         )
 
         if save_snapshots:
-            burning_t, positions_t = multi_env.get_snapshot()
+            burning_t, positions_t, fuel_t = multi_env.get_snapshot()
             burn_snap[step_idx + 1] = burning_t
             unit_pos_snap[step_idx + 1] = positions_t
+            if fuel_snap is not None:
+                fuel_snap[step_idx + 1] = fuel_t
 
         if verbose:
             print(
@@ -290,14 +316,16 @@ def run_multi(
             f"{run_label}__sharing_{sharing_algorithm_name}__"
             f"suppression_{suppression_algorithm_name}.npz"
         )
-        np.savez_compressed(
-            out_file,
+        save_kwargs = dict(
             burning_map=burn_snap,
             unit_positions=unit_pos_snap,
             steps=steps,
             lightning_seed=lightning_seed,
             spread_seed=spread_seed,
         )
+        if fuel_snap is not None:
+            save_kwargs["unit_fuel"] = fuel_snap
+        np.savez_compressed(out_file, **save_kwargs)
         meta_file = out_file.with_name(f"{out_file.stem}__meta.json")
         metadata = {
             "run_label": run_label,
@@ -316,6 +344,8 @@ def run_multi(
             "adj_matrix": multi_env.adj_matrix,
             "lightning_mu_log": multi_env.lightning_mu_log,
             "lightning_sigma_log": multi_env.lightning_sigma_log,
+            "max_fuel": multi_env.max_fuel,
+            "fuel_refuel_rate": multi_env.fuel_refuel_rate,
         }
         meta_file.write_text(json.dumps(metadata, indent=2), encoding="utf-8")
 
@@ -363,6 +393,8 @@ def main():
     parser.add_argument("--juris-travel-time", type=int, default=DEFAULTS["juris_travel_time"])
     parser.add_argument("--lightning-mu-log", type=float, default=DEFAULTS["lightning_mu_log"])
     parser.add_argument("--lightning-sigma-log", type=float, default=DEFAULTS["lightning_sigma_log"])
+    parser.add_argument("--max-fuel", type=int, default=None, help="Max fuel per unit (None = unlimited).")
+    parser.add_argument("--fuel-refuel-rate", type=int, default=1, help="Fuel gained per step at base.")
 
     # Aliases for single mode
     parser.add_argument("--rows", type=int, default=None, help="Alias for --per-juris-rows (single mode).")
@@ -403,6 +435,8 @@ def main():
             movement_per_step=args.movement_per_step,
             lightning_mu_log=args.lightning_mu_log,
             lightning_sigma_log=args.lightning_sigma_log,
+            max_fuel=args.max_fuel,
+            fuel_refuel_rate=args.fuel_refuel_rate,
         )
     else:
         run_multi(
@@ -430,6 +464,8 @@ def main():
             juris_travel_time=args.juris_travel_time,
             lightning_mu_log=args.lightning_mu_log,
             lightning_sigma_log=args.lightning_sigma_log,
+            max_fuel=args.max_fuel,
+            fuel_refuel_rate=args.fuel_refuel_rate,
         )
 
 

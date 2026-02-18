@@ -16,6 +16,10 @@ Each jurisdiction is a 2D grid of cells. At each timestep, three things happen t
 
 Units live on the grid and move each step by a `(dx, dy)` offset, clamped to grid bounds and limited by `movement_per_step` (Manhattan distance). The **suppression algorithm** decides where each unit moves. The current implementation is a greedy heuristic: each unit targets the nearest burning cell, claims it so other units pick different targets, and moves toward it. Idle units drift back toward the grid center.
 
+### Fuel System (Optional)
+
+When `max_fuel` is set, each unit starts with a full fuel tank and consumes 1 fuel per step. Units at the base (center cell) regain `fuel_refuel_rate` fuel per step (capped at `max_fuel`). Units that reach 0 fuel are immobilized and cannot move until refueled. Fuel-aware suppression algorithms automatically route low-fuel units back to base before they run out. When `max_fuel` is `None` (the default), fuel is disabled and the simulation behaves as before. Fuel is frozen during inter-jurisdiction transit (not consumed or refueled).
+
 ### Resource Sharing (Multi-Jurisdiction Only)
 
 When multiple jurisdictions are composed together, a **sharing algorithm** can transfer units between them. Transfers work in three phases:
@@ -100,6 +104,16 @@ python main.py --mode multi --sharing-algorithm periodic_transfer --suppression-
 python main.py --mode multi --num-juris-rows 3 --num-juris-cols 3 --per-juris-rows 20 --per-juris-cols 20 --save-snapshots
 ```
 
+### Fuel-Constrained Mode
+
+```bash
+# Single jurisdiction with fuel
+python main.py --mode single --suppression-algorithm greedy --max-fuel 30 --fuel-refuel-rate 2 --verbose --steps 100
+
+# Multi jurisdiction with fuel and sharing
+python main.py --mode multi --sharing-algorithm periodic_transfer --suppression-algorithm greedy --max-fuel 30 --fuel-refuel-rate 2 --period-s 10 --verbose --steps 100
+```
+
 ### Generating Animations
 
 ```bash
@@ -151,7 +165,7 @@ This section provides the technical context needed to extend this codebase.
 2. Subclass `SuppressionAlgorithm`, implement `actions(self, jenv, rng) -> np.ndarray` returning `(jenv.num_units, 2)`.
 3. Set `name = "my_algo"` class attribute.
 4. Register in `algorithms/suppression_algorithms/__init__.py` by importing and adding to `SUPPRESSION_ALGORITHM_REGISTRY`.
-5. The algorithm receives a `JurisdictionEnv` with these useful attributes: `burning_map`, `unit_positions`, `cell_row`, `cell_col`, `center_cell_row`, `center_cell_col`, `rows`, `cols`, `movement_per_step`, `num_units`. Use `jenv.units_per_cell()` and `jenv.spread_probabilities(fire_state)` for planning.
+5. The algorithm receives a `JurisdictionEnv` with these useful attributes: `burning_map`, `unit_positions`, `cell_row`, `cell_col`, `center_cell_row`, `center_cell_col`, `rows`, `cols`, `movement_per_step`, `num_units`, `unit_fuel` (None when fuel disabled), `max_fuel`. Use `jenv.units_per_cell()` and `jenv.spread_probabilities(fire_state)` for planning. Call `must_return_to_base(jenv)` from `algorithms.utils` to get a bool mask of units that should return to base for refueling.
 
 ### Adding a new sharing algorithm
 
@@ -184,3 +198,5 @@ This section provides the technical context needed to extend this codebase.
 | `lightning_sigma_log` | 2.0 | Log-normal std for lightning rate |
 | `juris_travel_time` | 4 | Steps to transit between adjacent jurisdictions |
 | `num_juris_rows` / `num_juris_cols` | 2 | Grid layout of jurisdictions (multi mode) |
+| `max_fuel` | None | Max fuel per unit (None = unlimited / disabled) |
+| `fuel_refuel_rate` | 1 | Fuel gained per step when at base (center cell) |
