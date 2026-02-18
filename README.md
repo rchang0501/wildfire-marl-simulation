@@ -60,6 +60,8 @@ wildfire-marl-simulation/
 │       ├── none.py                     # no-op (no transfers)
 │       └── periodic_transfer.py        # periodic best-to-worst transfer
 ├── main.py                             # CLI entry point (single / multi modes)
+├── compare.py                          # algorithm comparison runner + CLI
+├── compare_plots.py                    # matplotlib plots for comparison results
 └── fire_animator.py                    # renders snapshot .npz files to GIF/MP4
 ```
 
@@ -120,6 +122,51 @@ python main.py --mode multi --sharing-algorithm periodic_transfer --suppression-
 python main.py --mode multi --sharing-algorithm periodic_transfer --save-snapshots --output-dir snapshots
 python fire_animator.py --snapshots-dir snapshots --output-dir animations --fps 4
 ```
+
+### Comparing Algorithms
+
+`compare.py` runs the cartesian product of suppression x sharing algorithms across multiple random seeds, collects per-step metrics, computes summary statistics, and generates comparison plots.
+
+```bash
+# Default: all algorithms, 5 seeds, 200 steps
+python compare.py
+
+# Specific algorithms and more seeds
+python compare.py --suppression greedy lp_suppression --sharing none periodic_transfer --seeds 0 1 2 3 4 5 6 7 8 9
+
+# Quick test (fewer steps and seeds)
+python compare.py --steps 50 --num-seeds 3
+
+# Custom environment layout
+python compare.py --num-juris-rows 3 --num-juris-cols 3 --label "3x3_experiment"
+
+# Skip plot generation
+python compare.py --no-plots
+```
+
+Results are saved to `comparisons/<timestamp>_<label>/` with the following structure:
+
+```
+comparisons/20250101_120000_comparison/
+├── config.json          # environment and algorithm parameters used
+├── summary.json         # aggregate statistics (mean/std across seeds)
+├── raw_metrics.json     # full per-step data for every seed
+└── plots/
+    ├── timeseries_total_burning.png
+    ├── timeseries_burning_gini.png
+    ├── timeseries_units_in_transit.png
+    ├── timeseries_burning_per_juris.png
+    ├── summary_final_total_burning.png
+    ├── summary_cumulative_fire_steps.png
+    ├── summary_mean_burning_gini.png
+    └── summary_peak_total_burning.png
+```
+
+**Metrics collected per step:** total burning cells, burning per jurisdiction, units per jurisdiction, units in transit, rewards per jurisdiction.
+
+**Derived time-series:** cumulative burning (area under curve), Gini coefficient of per-jurisdiction burning (inequality), coefficient of variation of per-jurisdiction burning (disparity).
+
+**Summary statistics (per seed, then aggregated as mean +/- std):** final/peak/mean total burning, cumulative fire-steps, final/peak burning per jurisdiction, mean/peak Gini, mean CV.
 
 ### Using JurisdictionEnv Standalone
 
