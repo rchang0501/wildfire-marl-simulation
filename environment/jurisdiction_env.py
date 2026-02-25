@@ -20,6 +20,8 @@ class JurisdictionEnv:
         lightning_mu_log: float,
         lightning_sigma_log: float,
         num_units: int = 0,
+        max_fuel: int | None = None,
+        fuel_refuel_rate: int = 1,
     ):
         self.rows = int(rows)
         self.cols = int(cols)
@@ -29,6 +31,10 @@ class JurisdictionEnv:
         self.movement_per_step = int(movement_per_step)
         self.lightning_mu_log = float(lightning_mu_log)
         self.lightning_sigma_log = float(lightning_sigma_log)
+
+        # Fuel parameters
+        self.max_fuel = max_fuel
+        self.fuel_refuel_rate = int(fuel_refuel_rate)
 
         # Precomputed cell coordinate arrays
         num_cells = self.rows * self.cols
@@ -44,6 +50,12 @@ class JurisdictionEnv:
         self.burning_map = np.zeros((self.rows, self.cols), dtype=bool)
         # unit_positions: 1-D array of flat cell indices, variable length
         self.unit_positions = np.full(num_units, self.center_cell, dtype=int)
+
+        # Fuel state
+        if self.max_fuel is not None:
+            self.unit_fuel: np.ndarray | None = np.full(num_units, self.max_fuel, dtype=int)
+        else:
+            self.unit_fuel = None
 
     # ------------------------------------------------------------------
     # Properties
@@ -61,13 +73,25 @@ class JurisdictionEnv:
     # Unit management (called by MultiJurisdictionEnv)
     # ------------------------------------------------------------------
 
-    def add_units(self, cell_indices: np.ndarray | list[int]) -> None:
+    def add_units(
+        self,
+        cell_indices: np.ndarray | list[int],
+        fuel_levels: np.ndarray | list[int] | None = None,
+    ) -> None:
         """Add units at given cell positions."""
         new = np.asarray(cell_indices, dtype=int)
         self.unit_positions = np.concatenate([self.unit_positions, new])
+        if self.unit_fuel is not None:
+            if fuel_levels is not None:
+                new_fuel = np.asarray(fuel_levels, dtype=int)
+            else:
+                new_fuel = np.full(len(new), self.max_fuel, dtype=int)
+            self.unit_fuel = np.concatenate([self.unit_fuel, new_fuel])
 
     def remove_units(self, local_indices: np.ndarray | list[int]) -> None:
         """Remove units by their local index."""
+        if self.unit_fuel is not None:
+            self.unit_fuel = np.delete(self.unit_fuel, local_indices)
         self.unit_positions = np.delete(self.unit_positions, local_indices)
 
     # ------------------------------------------------------------------
@@ -129,14 +153,27 @@ class JurisdictionEnv:
         rng_lightning: np.random.Generator,
         burning_map: np.ndarray | None = None,
         unit_positions: np.ndarray | None = None,
+        unit_fuel: np.ndarray | None = None,
     ):
-        """Stateless step. Returns (next_burning, new_unit_positions, reward, burning_count)."""
+        """Stateless step. Returns (next_burning, new_unit_positions, new_fuel, reward, burning_count).
+
+        new_fuel is None when fuel is disabled.
+        """
         if burning_map is None:
             burning_map = self.burning_map
         if unit_positions is None:
             unit_positions = self.unit_positions
+        if unit_fuel is None:
+            unit_fuel = self.unit_fuel
 
         n = len(unit_positions)
+
+        # Fuel: immobilize 0-fuel units
+        immobilized = np.zeros(n, dtype=bool)
+        if unit_fuel is not None:
+            immobilized = unit_fuel <= 0
+            actions = actions.copy()
+            actions[immobilized] = 0
 
         # A) Movement
         new_unit_positions = unit_positions.copy()
@@ -155,6 +192,20 @@ class JurisdictionEnv:
             new_r = max(0, min(self.rows - 1, cur_r + dy))
             new_c = max(0, min(self.cols - 1, cur_c + dx))
             new_unit_positions[i] = new_r * self.cols + new_c
+
+        # Fuel: consume and refuel
+        new_fuel: np.ndarray | None = None
+        if unit_fuel is not None:
+            new_fuel = unit_fuel.copy()
+            # Active (non-immobilized) units consume 1 fuel
+            active = ~immobilized
+            new_fuel[active] -= 1
+            new_fuel = np.maximum(new_fuel, 0)
+            # Units at center cell after movement gain refuel
+            at_center = new_unit_positions == self.center_cell
+            new_fuel[at_center] = np.minimum(
+                new_fuel[at_center] + self.fuel_refuel_rate, self.max_fuel
+            )
 
         # B) Fire dynamics
         orig_burning = burning_map.copy()
@@ -188,7 +239,7 @@ class JurisdictionEnv:
         reward = -float(np.sum(persisting))
         count = int(np.sum(next_burning))
 
-        return next_burning, new_unit_positions, reward, count
+        return next_burning, new_unit_positions, new_fuel, reward, count
 
     def step(
         self,
@@ -197,11 +248,12 @@ class JurisdictionEnv:
         rng_lightning: np.random.Generator,
     ):
         """Stateful step. Mutates internal state."""
-        burning_map, unit_positions, reward, count = self.virtual_step(
+        burning_map, unit_positions, new_fuel, reward, count = self.virtual_step(
             actions=actions,
             rng_spread=rng_spread,
             rng_lightning=rng_lightning,
         )
         self.burning_map = burning_map
         self.unit_positions = unit_positions
-        return burning_map, unit_positions, reward, count
+        self.unit_fuel = new_fuel
+        return burning_map, unit_positions, new_fuel, reward, count

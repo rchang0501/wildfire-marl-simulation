@@ -11,6 +11,7 @@ class TransitUnit:
     from_juris: int
     to_juris: int
     remaining_steps: int
+    fuel: int | None = None
 
 
 class MultiJurisdictionEnv:
@@ -30,6 +31,8 @@ class MultiJurisdictionEnv:
         juris_travel_time: int,
         lightning_mu_log: float,
         lightning_sigma_log: float,
+        max_fuel: int | None = None,
+        fuel_refuel_rate: int = 1,
     ):
         self.num_juris_rows = int(num_juris_rows)
         self.num_juris_cols = int(num_juris_cols)
@@ -63,6 +66,9 @@ class MultiJurisdictionEnv:
             if c < self.num_juris_cols - 1:
                 self.adj_matrix[j][j + 1] = self.juris_travel_time
 
+        self.max_fuel = max_fuel
+        self.fuel_refuel_rate = int(fuel_refuel_rate)
+
         # Create jurisdiction environments
         common_kwargs = dict(
             rows=per_juris_rows,
@@ -72,6 +78,8 @@ class MultiJurisdictionEnv:
             movement_per_step=movement_per_step,
             lightning_mu_log=lightning_mu_log,
             lightning_sigma_log=lightning_sigma_log,
+            max_fuel=max_fuel,
+            fuel_refuel_rate=fuel_refuel_rate,
         )
         self.jurisdictions: list[JurisdictionEnv] = [
             JurisdictionEnv(num_units=num_units_per_juris, **common_kwargs)
@@ -140,6 +148,11 @@ class MultiJurisdictionEnv:
                 f"No direct connection from jurisdiction {cur_j} to {target_juris}."
             )
 
+        # Save fuel before removing from source jurisdiction
+        saved_fuel = None
+        if jenv.unit_fuel is not None:
+            saved_fuel = int(jenv.unit_fuel[local_idx])
+
         # Remove from source jurisdiction
         jenv.remove_units([local_idx])
 
@@ -157,6 +170,7 @@ class MultiJurisdictionEnv:
                 from_juris=cur_j,
                 to_juris=target_juris,
                 remaining_steps=travel_time,
+                fuel=saved_fuel,
             )
         )
 
@@ -183,7 +197,8 @@ class MultiJurisdictionEnv:
         for tu in arrivals:
             dest = self.jurisdictions[tu.to_juris]
             new_local_idx = dest.num_units
-            dest.add_units([dest.center_cell])
+            fuel_arg = [tu.fuel] if tu.fuel is not None else None
+            dest.add_units([dest.center_cell], fuel_levels=fuel_arg)
             self.unit_jurisdiction[tu.unit_id] = tu.to_juris
             self.unit_local_index[tu.unit_id] = new_local_idx
 
@@ -212,7 +227,7 @@ class MultiJurisdictionEnv:
             actions = suppression_actions.get(j_idx)
             if actions is None:
                 actions = np.zeros((jenv.num_units, 2), dtype=int)
-            _, _, reward, count = jenv.step(
+            _, _, _, reward, count = jenv.step(
                 actions, rng_spread=rng_spread, rng_lightning=rng_lightning
             )
             rewards.append(reward)
@@ -224,12 +239,12 @@ class MultiJurisdictionEnv:
     # Snapshot (for animator compatibility)
     # ------------------------------------------------------------------
 
-    def get_snapshot(self) -> tuple[np.ndarray, np.ndarray]:
-        """Return (J, R, C) burning map and (N, 2) unit positions
-        in the same format as the old Fire_Environment, for animator compatibility.
+    def get_snapshot(self) -> tuple[np.ndarray, np.ndarray, np.ndarray | None]:
+        """Return (J, R, C) burning map, (N, 2) unit positions, and (N,) unit fuel.
 
         unit_positions[:, 0] = jurisdiction index
         unit_positions[:, 1] = flat cell index (or negative if in transit)
+        unit_fuel is None when fuel is disabled.
         """
         J = self.num_juris
         R = self.per_juris_rows
@@ -240,6 +255,10 @@ class MultiJurisdictionEnv:
             burning[j_idx] = jenv.burning_map
 
         unit_positions = np.zeros((self.num_units_total, 2), dtype=int)
+        unit_fuel: np.ndarray | None = None
+        if self.max_fuel is not None:
+            unit_fuel = np.zeros(self.num_units_total, dtype=int)
+
         for uid in range(self.num_units_total):
             j = int(self.unit_jurisdiction[uid])
             if j < 0:
@@ -247,9 +266,14 @@ class MultiJurisdictionEnv:
                 tu = next(t for t in self.transit_units if t.unit_id == uid)
                 unit_positions[uid, 0] = tu.to_juris
                 unit_positions[uid, 1] = -tu.remaining_steps
+                if unit_fuel is not None and tu.fuel is not None:
+                    unit_fuel[uid] = tu.fuel
             else:
                 local_idx = int(self.unit_local_index[uid])
+                jenv = self.jurisdictions[j]
                 unit_positions[uid, 0] = j
-                unit_positions[uid, 1] = int(self.jurisdictions[j].unit_positions[local_idx])
+                unit_positions[uid, 1] = int(jenv.unit_positions[local_idx])
+                if unit_fuel is not None and jenv.unit_fuel is not None:
+                    unit_fuel[uid] = int(jenv.unit_fuel[local_idx])
 
-        return burning, unit_positions
+        return burning, unit_positions, unit_fuel

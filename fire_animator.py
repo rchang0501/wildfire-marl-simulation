@@ -162,10 +162,14 @@ def animate_snapshot_file(snapshot_file: Path, out_file: Path, fps: float = 2.0)
         cell = unit_in_which_cell.reshape(unit_in_which_cell.shape[0], -1)
         unit_positions = np.stack([loc_j, cell], axis=2)
 
+    # Fuel data (optional, backward compatible)
+    unit_fuel = data.get("unit_fuel", None)
+
     steps = burning_map.shape[0] - 1
     J, R, C = burning_map.shape[1:4]
 
     meta = load_snapshot_metadata(snapshot_file)
+    max_fuel = meta.get("max_fuel", None)
     num_juris_rows = meta.get("num_juris_rows")
     num_juris_cols = meta.get("num_juris_cols")
     ext_tiles = compute_tile_extents(
@@ -274,6 +278,23 @@ def animate_snapshot_file(snapshot_file: Path, out_file: Path, fps: float = 2.0)
             t.remove()
         transit_texts.clear()
 
+    # Fuel colormap: green (full) -> yellow -> red (empty)
+    fuel_cmap = plt.cm.RdYlGn if unit_fuel is not None else None
+
+    def _fuel_color_for_cell(frame_idx: int, j: int, r: int, c: int):
+        """Return face color for units at (j, r, c) based on avg fuel."""
+        if unit_fuel is None or max_fuel is None or max_fuel <= 0:
+            return "deepskyblue"
+        flat_cell = r * C + c
+        frame_pos = unit_positions[frame_idx]
+        frame_fuel = unit_fuel[frame_idx]
+        mask = (frame_pos[:, 0] == j) & (frame_pos[:, 1] == flat_cell)
+        if not np.any(mask):
+            return "deepskyblue"
+        avg_fuel = float(np.mean(frame_fuel[mask]))
+        ratio = avg_fuel / max_fuel
+        return fuel_cmap(ratio)
+
     def draw_units(frame_idx: int):
         upc = units_per_cell_from_arrays(
             unit_positions[frame_idx],
@@ -289,9 +310,10 @@ def animate_snapshot_file(snapshot_file: Path, out_file: Path, fps: float = 2.0)
                 cx = x0 + c + 0.5
                 cy = y1 - (r + 0.5)
 
+                fc = _fuel_color_for_cell(frame_idx, j, r, c)
                 rect = patches.Rectangle((x0 + c, y1 - (r + 1)), 1, 1,
                                          linewidth=1.5, edgecolor="cyan",
-                                         facecolor="deepskyblue", alpha=0.7, zorder=5)
+                                         facecolor=fc, alpha=0.7, zorder=5)
                 ax.add_patch(rect)
                 unit_patches.append(rect)
 
@@ -373,11 +395,19 @@ def animate_snapshot_file(snapshot_file: Path, out_file: Path, fps: float = 2.0)
 
         total_burning = int(np.sum(burning_map[frame_idx]))
         total_in_transit = int(np.sum(unit_positions[frame_idx, :, 1] < 0))
-        ax.set_title(
-            f"Fire Simulation | Step {frame_idx:03d}\n"
+        title_lines = [
+            f"Fire Simulation | Step {frame_idx:03d}",
             f"Burning total: {total_burning} | In-transit units: {total_in_transit}",
-            fontsize=12
-        )
+        ]
+        if unit_fuel is not None and max_fuel is not None:
+            frame_fuel = unit_fuel[frame_idx]
+            avg_fuel = float(np.mean(frame_fuel))
+            min_fuel = int(np.min(frame_fuel))
+            empty_count = int(np.sum(frame_fuel <= 0))
+            title_lines.append(
+                f"Fuel avg: {avg_fuel:.1f}/{max_fuel} | min: {min_fuel} | empty: {empty_count}"
+            )
+        ax.set_title("\n".join(title_lines), fontsize=12)
 
         artists = tile_ims + tile_boxes + tile_titles + unit_patches + unit_texts
         artists += transit_patches + transit_texts

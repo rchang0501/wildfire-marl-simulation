@@ -187,6 +187,8 @@ def run_comparison(
                 juris_travel_time=env_params["juris_travel_time"],
                 lightning_mu_log=env_params["lightning_mu_log"],
                 lightning_sigma_log=env_params["lightning_sigma_log"],
+                max_fuel=env_params.get("max_fuel"),
+                fuel_refuel_rate=env_params.get("fuel_refuel_rate", 1),
             )
 
             derived = compute_derived_timeseries(metrics)
@@ -336,6 +338,8 @@ def main():
     parser.add_argument("--juris-travel-time", type=int, default=DEFAULTS["juris_travel_time"])
     parser.add_argument("--lightning-mu-log", type=float, default=DEFAULTS["lightning_mu_log"])
     parser.add_argument("--lightning-sigma-log", type=float, default=DEFAULTS["lightning_sigma_log"])
+    parser.add_argument("--max-fuel", type=int, default=None, help="Max fuel per unit (None = unlimited).")
+    parser.add_argument("--fuel-refuel-rate", type=int, default=1, help="Fuel gained per step at base.")
 
     # Output
     parser.add_argument("--output-dir", default="comparisons")
@@ -369,6 +373,8 @@ def main():
         "juris_travel_time": args.juris_travel_time,
         "lightning_mu_log": args.lightning_mu_log,
         "lightning_sigma_log": args.lightning_sigma_log,
+        "max_fuel": args.max_fuel,
+        "fuel_refuel_rate": args.fuel_refuel_rate,
     }
 
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
