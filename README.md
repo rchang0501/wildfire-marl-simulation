@@ -14,7 +14,11 @@ Each jurisdiction is a 2D grid of cells. At each timestep, three things happen t
 
 ### Suppression Units
 
-Units live on the grid and move each step by a `(dx, dy)` offset, clamped to grid bounds and limited by `movement_per_step` (Manhattan distance). The **suppression algorithm** decides where each unit moves. The current implementation is a greedy heuristic: each unit targets the nearest burning cell, claims it so other units pick different targets, and moves toward it. Idle units drift back toward the grid center.
+Units live on the grid and move each step by a `(dx, dy)` offset, clamped to grid bounds and limited by `movement_per_step` (Manhattan distance). The **suppression algorithm** decides where each unit moves. Three algorithms are available:
+
+- **`greedy`** — Each unit targets the nearest burning cell, claims it so other units pick different targets, and moves toward it. Idle units drift toward center.
+- **`lp_suppression`** — Optimal unit-to-fire assignment via linear programming (minimizes total Manhattan distance).
+- **`rl`** — Learned policy via PPO. A CNN+MLP actor-critic observes the full grid state, per-drone features, and global scalars, then selects from each drone's K=10 nearest fires. Requires a trained model (see [RL Training](#rl-training)).
 
 ### Fuel System (Optional)
 
@@ -53,7 +57,16 @@ wildfire-marl-simulation/
 │   ├── suppression_algorithms/
 │   │   ├── __init__.py                 # SUPPRESSION_ALGORITHM_REGISTRY
 │   │   ├── algorithm_base.py           # SuppressionAlgorithm ABC
-│   │   └── greedy.py                   # greedy nearest-fire heuristic
+│   │   ├── greedy.py                   # greedy nearest-fire heuristic
+│   │   ├── lp_suppression.py           # LP-based optimal assignment
+│   │   └── rl_suppression.py           # RL inference wrapper (loads trained PPO model)
+│   ├── rl/                             # RL training module
+│   │   ├── observation.py              # state space: grid channels, unit/global features, K-nearest
+│   │   ├── action_translation.py       # action space: K-nearest fire selection → (dx,dy)
+│   │   ├── reward.py                   # reward: -burning/total + 0.5*extinguished/total
+│   │   ├── network.py                  # WildfireActorCritic (CNN + MLP, per-drone policy heads)
+│   │   ├── gym_wrapper.py              # Gymnasium env wrapping JurisdictionEnv
+│   │   └── train.py                    # PPO training script (python -m algorithms.rl.train)
 │   └── sharing_algorithms/
 │       ├── __init__.py                 # SHARING_ALGORITHM_REGISTRY
 │       ├── algorithm_base.py           # SharingAlgorithm ABC
@@ -77,7 +90,7 @@ conda activate sim-wildfire-marl
 Or install dependencies manually:
 
 ```bash
-pip install numpy matplotlib pillow
+pip install -r requirements.txt
 ```
 
 ## Running the Simulation
@@ -122,6 +135,23 @@ python main.py --mode multi --sharing-algorithm periodic_transfer --suppression-
 python main.py --mode multi --sharing-algorithm periodic_transfer --save-snapshots --output-dir snapshots
 python fire_animator.py --snapshots-dir snapshots --output-dir animations --fps 4
 ```
+
+### RL Training
+
+Train a PPO suppression agent, then evaluate it alongside baselines:
+
+```bash
+# Train (saves to trained_models/rl/)
+python -m algorithms.rl.train --total-timesteps 500000 --output-dir trained_models/rl
+
+# Evaluate trained model in single mode
+python main.py --mode single --suppression-algorithm rl --suppression-param-dir trained_models/rl --verbose --steps 200
+
+# Compare against baselines
+python compare.py --suppression greedy lp_suppression rl --sharing none --steps 200 --num-seeds 20
+```
+
+Key training flags: `--lr` (default 3e-4), `--rollout-steps` (default 2048), `--num-epochs` (default 4), `--gamma` (default 0.99), `--episode-steps` (default 200), `--seed`, `--max-fuel`. The training script saves `best_model.pt`, `final_model.pt`, checkpoints, and `params.json` for inference.
 
 ### Comparing Algorithms
 
@@ -222,6 +252,26 @@ This section provides the technical context needed to extend this codebase.
 4. `get_steering_actions` returns `{unit_id: (dx, dy)}` to override suppression actions for specific units (e.g., to walk them toward center before transfer).
 5. Register in `algorithms/sharing_algorithms/__init__.py`.
 6. Useful `multi_env` attributes: `jurisdictions` (list of `JurisdictionEnv`), `unit_jurisdiction`, `unit_local_index`, `burning_counts`, `juris_row`, `juris_col`, `adj_matrix`, `num_juris_rows`, `num_juris_cols`, `transit_units`.
+
+### RL agent internals
+
+The RL module (`algorithms/rl/`) implements a centralized PPO agent for single-jurisdiction suppression.
+
+**State space** (`observation.py`): Dict observation with 4 components:
+- `grid` — `(4, 16, 16)` float32: burning map, spread probabilities, units-per-cell, recently extinguished.
+- `units` — `(8, 4)` float32: normalized row, col, fuel, must_return flag per drone.
+- `global_features` — `(3,)` float32: burning fraction, time progress, delta burning.
+- `k_nearest` — `(8, 10, 2)` int: row/col of K=10 nearest fires per drone (padded with center cell).
+
+**Action space** (`action_translation.py`): `MultiDiscrete([11]*8)` — each drone selects one of K=10 nearest fires or idle (index 10). Translated to `(dx, dy)` via `step_toward()`. Drones with `must_return_to_base=True` are overridden to return to center.
+
+**Reward** (`reward.py`): `-burning_after/total_cells + 0.5 * extinguished/total_cells`. Range ~[-1, 0.5]. Dense, aligned with minimizing cumulative fire.
+
+**Network** (`network.py`): `WildfireActorCritic` — CNN grid encoder (Conv3x3→32→Conv3x3→64→AdaptiveAvgPool→FC128), shared unit MLP (4→32→32), global MLP (3→16). Combined via MLP(176→128→128). Per-drone policy head: concat(shared128, drone_embed32)→MLP(160→64→11). Shared value head: MLP(128→64→1).
+
+**Gym wrapper** (`gym_wrapper.py`): `WildfireEnv` wraps `JurisdictionEnv` as a Gymnasium env. Handles reset/seed/episode tracking. Builds observations, translates actions, computes reward.
+
+**Inference** (`rl_suppression.py`): `RLSuppressionAlgorithm` subclasses `SuppressionAlgorithm`, loads `param_dir/best_model.pt`, uses deterministic argmax policy. Tracks `prev_burning` and `timestep` across calls. Registered as `"rl"` in `SUPPRESSION_ALGORITHM_REGISTRY`.
 
 ### `virtual_step` for planning
 
