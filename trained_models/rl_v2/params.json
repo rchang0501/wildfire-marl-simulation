@@ -1,0 +1,7 @@
+{
+  "num_units": 8,
+  "k": 10,
+  "rows": 16,
+  "cols": 16,
+  "model_file": "best_model.pt"
+}
