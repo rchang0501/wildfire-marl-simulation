@@ -8,8 +8,10 @@ Saves checkpoints and the final model to the output directory.
 """
 
 import argparse
+import glob
 import json
 import os
+import re
 import time
 
 import numpy as np
@@ -211,6 +213,30 @@ def ppo_update(
     }
 
 
+def find_latest_checkpoint(output_dir: str) -> tuple[str | None, int]:
+    """Find the latest checkpoint file and extract its step count.
+
+    Returns:
+        (checkpoint_path, step_count) or (None, 0) if no checkpoints found.
+    """
+    pattern = os.path.join(output_dir, "checkpoint_*.pt")
+    files = glob.glob(pattern)
+    if not files:
+        return None, 0
+
+    best_path = None
+    best_steps = 0
+    for f in files:
+        match = re.search(r"checkpoint_(\d+)\.pt$", f)
+        if match:
+            steps = int(match.group(1))
+            if steps > best_steps:
+                best_steps = steps
+                best_path = f
+
+    return best_path, best_steps
+
+
 def train(args: argparse.Namespace) -> None:
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"Using device: {device}")
@@ -244,16 +270,40 @@ def train(args: argparse.Namespace) -> None:
     # Output directory
     os.makedirs(args.output_dir, exist_ok=True)
 
+    # Resume from checkpoint if requested
+    total_steps = 0
+    num_updates = 0
+    best_mean_reward = -float("inf")
+
+    if args.resume:
+        ckpt_path, ckpt_steps = find_latest_checkpoint(args.output_dir)
+        if ckpt_path is not None:
+            checkpoint = torch.load(ckpt_path, map_location=device, weights_only=True)
+            # Support both old-style (bare state_dict) and new-style (dict with keys)
+            if isinstance(checkpoint, dict) and "model_state_dict" in checkpoint:
+                model.load_state_dict(checkpoint["model_state_dict"])
+                optimizer.load_state_dict(checkpoint["optimizer_state_dict"])
+                total_steps = checkpoint.get("total_steps", ckpt_steps)
+                num_updates = checkpoint.get("num_updates", total_steps // args.rollout_steps)
+                best_mean_reward = checkpoint.get("best_mean_reward", -float("inf"))
+                print(f"Resumed from {ckpt_path} (full checkpoint) at step {total_steps}")
+            else:
+                # Old-style checkpoint: bare state_dict, no optimizer state
+                model.load_state_dict(checkpoint)
+                total_steps = ckpt_steps
+                num_updates = total_steps // args.rollout_steps
+                print(f"Resumed from {ckpt_path} (model weights only) at step {total_steps}")
+                print(f"  Note: optimizer state not available, Adam reinitialized")
+        else:
+            print(f"--resume set but no checkpoints found in {args.output_dir}, starting fresh")
+
     # Save training config
     config = vars(args)
     with open(os.path.join(args.output_dir, "train_config.json"), "w") as f:
         json.dump(config, f, indent=2)
 
     # Training loop
-    total_steps = 0
-    num_updates = 0
     episode_rewards = []
-    best_mean_reward = -float("inf")
 
     obs, _ = env.reset()
     start_time = time.time()
@@ -326,10 +376,16 @@ def train(args: argparse.Namespace) -> None:
                     os.path.join(args.output_dir, "best_model.pt"),
                 )
 
-        # Periodic checkpoint
+        # Periodic checkpoint (includes optimizer state for resumability)
         if num_updates % args.save_interval == 0:
             torch.save(
-                model.state_dict(),
+                {
+                    "model_state_dict": model.state_dict(),
+                    "optimizer_state_dict": optimizer.state_dict(),
+                    "total_steps": total_steps,
+                    "num_updates": num_updates,
+                    "best_mean_reward": best_mean_reward,
+                },
                 os.path.join(args.output_dir, f"checkpoint_{total_steps}.pt"),
             )
 
@@ -345,6 +401,7 @@ def train(args: argparse.Namespace) -> None:
         "k": K_NEAREST,
         "rows": args.rows,
         "cols": args.cols,
+        "unit_features": 5,
         "model_file": "best_model.pt",
     }
     with open(os.path.join(args.output_dir, "params.json"), "w") as f:
@@ -387,6 +444,8 @@ def main():
     parser.add_argument("--output-dir", type=str, default="trained_models/rl")
     parser.add_argument("--log-interval", type=int, default=10)
     parser.add_argument("--save-interval", type=int, default=50)
+    parser.add_argument("--resume", action="store_true",
+                        help="Resume from latest checkpoint in output-dir")
 
     args = parser.parse_args()
     train(args)

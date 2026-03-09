@@ -41,7 +41,7 @@ class GridEncoder(nn.Module):
 class UnitEncoder(nn.Module):
     """Shared MLP encoder for per-drone features."""
 
-    def __init__(self, in_features: int = 4, embed_dim: int = 32):
+    def __init__(self, in_features: int = 5, embed_dim: int = 32):
         super().__init__()
         self.fc1 = nn.Linear(in_features, 32)
         self.fc2 = nn.Linear(32, embed_dim)
@@ -104,7 +104,7 @@ class WildfireActorCritic(nn.Module):
         self,
         num_units: int = 8,
         grid_channels: int = 4,
-        unit_features: int = 4,
+        unit_features: int = 5,
         global_features: int = 3,
         grid_embed_dim: int = 128,
         unit_embed_dim: int = 32,
@@ -232,6 +232,37 @@ class WildfireActorCritic(nn.Module):
 
         return logits, value
 
+    def _resolve_cell_index(
+        self,
+        k_nearest: torch.Tensor,
+        drone_idx: int,
+        action_idx: torch.Tensor,
+    ) -> torch.Tensor:
+        """Resolve action indices to flat cell indices for a single drone.
+
+        Args:
+            k_nearest: (B, N, K, 2) absolute (row, col) fire targets
+            drone_idx: which drone
+            action_idx: (B,) action indices
+
+        Returns:
+            (B,) flat cell indices, or -1 for idle actions
+        """
+        B = action_idx.shape[0]
+        idle_mask = action_idx == self.k  # idle action
+        # Clamp to valid range for gather (idle will be overwritten)
+        safe_idx = action_idx.clamp(0, self.k - 1)
+
+        # k_nearest[:, drone_idx, :, :] -> (B, K, 2)
+        drone_targets = k_nearest[:, drone_idx, :, :]
+        # Gather the target row/col for selected action
+        row = drone_targets[torch.arange(B, device=action_idx.device), safe_idx, 0].long()
+        col = drone_targets[torch.arange(B, device=action_idx.device), safe_idx, 1].long()
+
+        flat = row * self.cols + col
+        flat[idle_mask] = -1
+        return flat
+
     def get_action_and_value(
         self,
         grid: torch.Tensor,
@@ -240,28 +271,105 @@ class WildfireActorCritic(nn.Module):
         k_nearest: torch.Tensor | None = None,
         action: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
-        """Sample actions or evaluate given actions.
+        """Sample or evaluate actions with sequential spatial masking.
+
+        Drones are processed in order 0..N-1. For each drone, fire targets
+        that map to an already-claimed cell are masked (logit = -inf).
+        Idle (index K) is never masked. This guarantees no two drones
+        target the same cell.
 
         Args:
             grid, units, global_features: observation tensors (batch dims)
-            k_nearest: (batch, num_units, K, 2) fire target coords
-            action: (batch, num_units) int tensor. If None, sample from policy.
+            k_nearest: (B, N, K, 2) fire target coords
+            action: (B, N) int tensor. If None, sample from policy.
 
         Returns:
-            action: (batch, num_units) sampled or given actions
-            log_prob: (batch,) sum of per-drone log probs
-            entropy: (batch,) sum of per-drone entropies
-            value: (batch, 1) state value
+            action: (B, N) sampled or given actions
+            log_prob: (B,) sum of per-drone log probs
+            entropy: (B,) sum of per-drone entropies
+            value: (B, 1) state value
         """
         logits, value = self.forward(grid, units, global_features, k_nearest)
         # logits: (B, N, num_actions)
 
-        dist = torch.distributions.Categorical(logits=logits)
+        B = logits.shape[0]
+        N = self.num_units
+        sampling = action is None
 
-        if action is None:
-            action = dist.sample()                              # (B, N)
+        if sampling:
+            action = torch.zeros(B, N, dtype=torch.long, device=logits.device)
 
-        log_prob = dist.log_prob(action).sum(dim=1)             # (B,)
-        entropy = dist.entropy().sum(dim=1)                     # (B,)
+        # Track claimed cells per batch element: (B, rows*cols)
+        claimed = torch.zeros(B, self.rows * self.cols, dtype=torch.bool, device=logits.device)
 
-        return action, log_prob, entropy, value
+        total_log_prob = torch.zeros(B, device=logits.device)
+        total_entropy = torch.zeros(B, device=logits.device)
+
+        for i in range(N):
+            drone_logits = logits[:, i, :].clone()  # (B, num_actions)
+
+            # Mask fire actions whose target cell is already claimed
+            if k_nearest is not None:
+                for a in range(self.k):
+                    cell_flat = self._resolve_cell_index(k_nearest, i, torch.full((B,), a, dtype=torch.long, device=logits.device))
+                    # cell_flat: (B,) — flat cell index for action a of drone i
+                    # Check if claimed for each batch element
+                    is_claimed = claimed[torch.arange(B, device=logits.device), cell_flat.clamp(0)] & (cell_flat >= 0)
+                    drone_logits[is_claimed, a] = float("-inf")
+
+            dist = torch.distributions.Categorical(logits=drone_logits)
+
+            if sampling:
+                action[:, i] = dist.sample()
+
+            total_log_prob += dist.log_prob(action[:, i])
+            total_entropy += dist.entropy()
+
+            # Claim the chosen cell (if not idle)
+            if k_nearest is not None:
+                chosen_cell = self._resolve_cell_index(k_nearest, i, action[:, i])
+                valid = chosen_cell >= 0
+                if valid.any():
+                    claimed[valid, chosen_cell[valid]] = True
+
+        return action, total_log_prob, total_entropy, value
+
+    def get_greedy_action_masked(
+        self,
+        grid: torch.Tensor,
+        units: torch.Tensor,
+        global_features: torch.Tensor,
+        k_nearest: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        """Deterministic (argmax) action selection with sequential spatial masking.
+
+        Same masking logic as get_action_and_value but uses argmax instead of sample.
+
+        Returns:
+            action: (B, N) greedy actions
+        """
+        logits, _ = self.forward(grid, units, global_features, k_nearest)
+        B = logits.shape[0]
+        N = self.num_units
+
+        action = torch.zeros(B, N, dtype=torch.long, device=logits.device)
+        claimed = torch.zeros(B, self.rows * self.cols, dtype=torch.bool, device=logits.device)
+
+        for i in range(N):
+            drone_logits = logits[:, i, :].clone()
+
+            if k_nearest is not None:
+                for a in range(self.k):
+                    cell_flat = self._resolve_cell_index(k_nearest, i, torch.full((B,), a, dtype=torch.long, device=logits.device))
+                    is_claimed = claimed[torch.arange(B, device=logits.device), cell_flat.clamp(0)] & (cell_flat >= 0)
+                    drone_logits[is_claimed, a] = float("-inf")
+
+            action[:, i] = drone_logits.argmax(dim=-1)
+
+            if k_nearest is not None:
+                chosen_cell = self._resolve_cell_index(k_nearest, i, action[:, i])
+                valid = chosen_cell >= 0
+                if valid.any():
+                    claimed[valid, chosen_cell[valid]] = True
+
+        return action

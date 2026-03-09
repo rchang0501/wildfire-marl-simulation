@@ -78,7 +78,7 @@ class WildfireEnv(gym.Env):
                 low=0.0, high=np.inf, shape=(4, rows, cols), dtype=np.float32
             ),
             "units": spaces.Box(
-                low=0.0, high=1.0, shape=(num_units, 4), dtype=np.float32
+                low=0.0, high=1.0, shape=(num_units, 5), dtype=np.float32
             ),
             "global_features": spaces.Box(
                 low=-1.0, high=1.0, shape=(3,), dtype=np.float32

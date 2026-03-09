@@ -2,7 +2,7 @@
 
 Builds a structured observation from a JurisdictionEnv consisting of:
 - Grid channels: (4, rows, cols) — burning, spread probs, unit density, recently extinguished
-- Per-unit features: (num_units, 4) — normalized position, fuel, must_return flag
+- Per-unit features: (num_units, 5) — normalized position, fuel, must_return flag, drone index
 - Global features: (3,) — burning fraction, time progress, delta burning
 """
 
@@ -39,12 +39,12 @@ def build_grid_channels(
 
 
 def build_unit_features(jenv: JurisdictionEnv) -> np.ndarray:
-    """Build (num_units, 4) per-unit feature matrix.
+    """Build (num_units, 5) per-unit feature matrix.
 
-    Features: [row/rows, col/cols, fuel/max_fuel, must_return]
+    Features: [row/rows, col/cols, fuel/max_fuel, must_return, drone_index]
     """
     n = jenv.num_units
-    features = np.zeros((n, 4), dtype=np.float32)
+    features = np.zeros((n, 5), dtype=np.float32)
 
     if n == 0:
         return features
@@ -61,6 +61,12 @@ def build_unit_features(jenv: JurisdictionEnv) -> np.ndarray:
         features[:, 2] = 1.0
 
     features[:, 3] = must_return_to_base(jenv).astype(np.float32)
+
+    # Drone index normalized to [0, 1] — breaks input symmetry for co-located drones
+    if n > 1:
+        features[:, 4] = np.arange(n, dtype=np.float32) / (n - 1)
+    else:
+        features[:, 4] = 0.0
 
     return features
 
@@ -135,7 +141,7 @@ def build_observation(
 
     Returns dict with keys:
         grid: (4, rows, cols) float32
-        units: (num_units, 4) float32
+        units: (num_units, 5) float32
         global_features: (3,) float32
         k_nearest: (num_units, K, 2) int — target candidates for action space
     """

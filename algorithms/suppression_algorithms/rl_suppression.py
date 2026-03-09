@@ -36,9 +36,12 @@ class RLSuppressionAlgorithm(SuppressionAlgorithm):
         cols = self.params.get("cols", 16)
         model_file = self.params.get("model_file", "best_model.pt")
 
+        unit_features = self.params.get("unit_features", 5)
+
         # Build model
         self._model = WildfireActorCritic(
-            num_units=num_units, k=k, rows=rows, cols=cols
+            num_units=num_units, k=k, rows=rows, cols=cols,
+            unit_features=unit_features,
         ).to(self._device)
 
         # Load weights if param_dir provided
@@ -82,10 +85,11 @@ class RLSuppressionAlgorithm(SuppressionAlgorithm):
         global_t = torch.tensor(obs["global_features"], dtype=torch.float32, device=self._device).unsqueeze(0)
         kn_t = torch.tensor(obs["k_nearest"], dtype=torch.float32, device=self._device).unsqueeze(0)
 
-        # Get action from policy (deterministic at inference — use argmax)
+        # Get action from policy (deterministic with sequential spatial masking)
         with torch.no_grad():
-            logits, _ = self._model(grid_t, units_t, global_t, k_nearest=kn_t)
-            agent_actions = logits.argmax(dim=-1).squeeze(0).cpu().numpy()
+            agent_actions = self._model.get_greedy_action_masked(
+                grid_t, units_t, global_t, k_nearest=kn_t
+            ).squeeze(0).cpu().numpy()
 
         # Translate to (dx, dy)
         env_actions = translate_actions(jenv, agent_actions, obs["k_nearest"])
