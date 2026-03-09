@@ -18,7 +18,7 @@ Units live on the grid and move each step by a `(dx, dy)` offset, clamped to gri
 
 - **`greedy`** — Each unit targets the nearest burning cell, claims it so other units pick different targets, and moves toward it. Idle units drift toward center.
 - **`lp_suppression`** — Optimal unit-to-fire assignment via linear programming (minimizes total Manhattan distance).
-- **`rl`** — Learned policy via PPO. A CNN+MLP actor-critic observes the full grid state, per-drone features, and global scalars, then selects from each drone's K=10 nearest fires. Requires a trained model (see [RL Training](#rl-training)).
+- **`rl`** — Learned policy via PPO (see [RL Architecture](#rl-architecture)). A CNN+MLP actor-critic observes the full grid state, per-drone features (including drone index), and global scalars, then selects from each drone's K=10 nearest fires using sequential spatial masking to prevent drones from targeting the same cell. Requires a trained model (see [RL Training](#rl-training)).
 
 ### Fuel System (Optional)
 
@@ -141,17 +141,23 @@ python fire_animator.py --snapshots-dir snapshots --output-dir animations --fps 
 Train a PPO suppression agent, then evaluate it alongside baselines:
 
 ```bash
-# Train (saves to trained_models/rl/)
-python -m algorithms.rl.train --total-timesteps 500000 --output-dir trained_models/rl
+# Train (saves to trained_models/rl_v3/)
+python -m algorithms.rl.train --total-timesteps 500000 --output-dir trained_models/rl_v3
+
+# Resume from latest checkpoint (if training was interrupted)
+python -m algorithms.rl.train --total-timesteps 500000 --output-dir trained_models/rl_v3 --resume
 
 # Evaluate trained model in single mode
-python main.py --mode single --suppression-algorithm rl --suppression-param-dir trained_models/rl --verbose --steps 200
+python main.py --mode single --suppression-algorithm rl --suppression-param-dir trained_models/rl_v3 --verbose --steps 200 --save-snapshots --output-dir results
+
+# Generate animation from saved snapshots
+python fire_animator.py --snapshots-dir results --output-dir animations --fps 2.0
 
 # Compare against baselines
-python compare.py --suppression greedy lp_suppression rl --sharing none --steps 200 --num-seeds 20
+python compare.py --suppression greedy lp_suppression rl --sharing none --suppression-param-dir trained_models/rl_v3 --num-seeds 5 --steps 200 --label rl_v3_comparison --verbose
 ```
 
-Key training flags: `--lr` (default 3e-4), `--rollout-steps` (default 2048), `--num-epochs` (default 4), `--gamma` (default 0.99), `--episode-steps` (default 200), `--seed`, `--max-fuel`. The training script saves `best_model.pt`, `final_model.pt`, checkpoints, and `params.json` for inference.
+Key training flags: `--lr` (default 3e-4), `--rollout-steps` (default 2048), `--num-epochs` (default 4), `--gamma` (default 0.99), `--episode-steps` (default 200), `--seed`, `--max-fuel`. The training script saves `best_model.pt`, `final_model.pt`, periodic checkpoints (with optimizer state for resumability), and `params.json` for inference.
 
 ### Comparing Algorithms
 
@@ -163,6 +169,9 @@ python compare.py
 
 # Specific algorithms and more seeds
 python compare.py --suppression greedy lp_suppression --sharing none periodic_transfer --seeds 0 1 2 3 4 5 6 7 8 9
+
+# Include RL (requires --suppression-param-dir pointing to trained model)
+python compare.py --suppression greedy lp_suppression rl --sharing none --suppression-param-dir trained_models/rl_v3 --num-seeds 5
 
 # Quick test (fewer steps and seeds)
 python compare.py --steps 50 --num-seeds 3
@@ -253,25 +262,89 @@ This section provides the technical context needed to extend this codebase.
 5. Register in `algorithms/sharing_algorithms/__init__.py`.
 6. Useful `multi_env` attributes: `jurisdictions` (list of `JurisdictionEnv`), `unit_jurisdiction`, `unit_local_index`, `burning_counts`, `juris_row`, `juris_col`, `adj_matrix`, `num_juris_rows`, `num_juris_cols`, `transit_units`.
 
-### RL agent internals
+### RL Architecture
 
-The RL module (`algorithms/rl/`) implements a centralized PPO agent for single-jurisdiction suppression.
+The RL module (`algorithms/rl/`) implements a centralized PPO agent for single-jurisdiction suppression. The architecture has gone through three iterations to solve a drone clustering problem.
 
-**State space** (`observation.py`): Dict observation with 4 components:
+#### State Space (`observation.py`)
+
+Dict observation with 4 components:
 - `grid` — `(4, 16, 16)` float32: burning map, spread probabilities, units-per-cell, recently extinguished.
-- `units` — `(8, 4)` float32: normalized row, col, fuel, must_return flag per drone.
+- `units` — `(8, 5)` float32: normalized row, col, fuel, must_return, **drone index** (`i/(N-1)`, range [0,1]).
 - `global_features` — `(3,)` float32: burning fraction, time progress, delta burning.
 - `k_nearest` — `(8, 10, 2)` int: row/col of K=10 nearest fires per drone (padded with center cell).
 
-**Action space** (`action_translation.py`): `MultiDiscrete([11]*8)` — each drone selects one of K=10 nearest fires or idle (index 10). Translated to `(dx, dy)` via `step_toward()`. Drones with `must_return_to_base=True` are overridden to return to center.
+#### Action Space (`action_translation.py`)
 
-**Reward** (`reward.py`): `-burning_after/total_cells + 0.5 * extinguished/total_cells`. Range ~[-1, 0.5]. Dense, aligned with minimizing cumulative fire.
+`MultiDiscrete([11]*8)` — each drone selects one of K=10 nearest fires or idle (index 10). Translated to `(dx, dy)` via `step_toward()`. Drones with `must_return_to_base=True` are overridden to return to center.
 
-**Network** (`network.py`): `WildfireActorCritic` — CNN grid encoder (Conv3x3→32→Conv3x3→64→AdaptiveAvgPool→FC128), shared unit MLP (4→32→32), global MLP (3→16). Combined via MLP(176→128→128). Per-drone policy head: concat(shared128, drone_embed32)→MLP(160→64→11). Shared value head: MLP(128→64→1).
+#### Reward (`reward.py`)
 
-**Gym wrapper** (`gym_wrapper.py`): `WildfireEnv` wraps `JurisdictionEnv` as a Gymnasium env. Handles reset/seed/episode tracking. Builds observations, translates actions, computes reward.
+`-burning_after/total_cells + 0.5 * extinguished/total_cells`. Range ~[-1, 0.5]. Dense, aligned with minimizing cumulative fire. Includes an overlap penalty for drones stacking on the same cell.
 
-**Inference** (`rl_suppression.py`): `RLSuppressionAlgorithm` subclasses `SuppressionAlgorithm`, loads `param_dir/best_model.pt`, uses deterministic argmax policy. Tracks `prev_burning` and `timestep` across calls. Registered as `"rl"` in `SUPPRESSION_ALGORITHM_REGISTRY`.
+#### Network (`network.py`)
+
+`WildfireActorCritic` processes observations through four parallel encoders, combines them, then produces per-drone policy logits and a state value:
+
+```
+Grid (4,16,16) ──► GridEncoder (Conv3x3→32→Conv3x3→64→AvgPool→FC128) ──► (128,)
+                                                                             │
+Units (8,5) ──► UnitEncoder (shared MLP: 5→32→32) ──► per_unit (8,32)      │
+                       │                                    │                │
+                       ├── mean-pool ──► unit_summary (32,) ─┤               │
+                       │                                     │               │
+Global (3,) ──► GlobalEncoder (MLP: 3→16) ──► (16,) ────────┘               │
+                                                             │               │
+                                              cat [128, 32, 16] = (176,)    │
+                                                             │               │
+                                              SharedMLP (176→128→128) ──► shared (128,)
+                                                             │
+                    ┌────────────────────────────────────────┤
+                    │                                        │
+             ┌──────┴──────┐                          ValueHead (128→64→1)
+             │  Per-drone  │
+             │  Policy     │
+             └──────┬──────┘
+                    │
+    For each drone i:
+      cat [shared(128), unit_embed_i(32), kn_embed_i(32)] = (192,)
+         │
+      PolicyHead (192→64→11) ──► logits_i
+```
+
+The K-Nearest Encoder converts absolute fire coords to relative coords `(fire - drone) / grid_size`, flattens K*2=20 floats, and processes through MLP (20→32→32).
+
+#### Sequential Spatial Masking
+
+The key architectural innovation that prevents drone clustering. `forward()` produces raw `(B, N, 11)` logits in one pass. Then `get_action_and_value()` samples actions sequentially:
+
+1. For each drone `i` in order `0..N-1`:
+   - Clone drone `i`'s logits
+   - For each fire action `a` in `0..K-1`: resolve the spatial cell from `k_nearest[i, a]`. If that cell is already claimed by a previous drone, set the logit to `-inf`
+   - Idle (index K=10) is **never masked** — always available as fallback
+   - Sample from the masked distribution (training) or argmax (inference via `get_greedy_action_masked()`)
+   - Claim the chosen cell
+2. Claimed cells tracked via `(B, rows*cols)` bool tensor — negligible overhead
+
+This is **cell-based masking**, not action-index-based: drone 1's action 3 and drone 2's action 5 may target the same physical cell, and the masking catches this. The masking is PPO-consistent — during the eval pass, the same sequential order with stored actions reconstructs correct log probabilities.
+
+#### Design History
+
+| Version | Key Changes | Outcome |
+|---------|------------|---------|
+| v1 | Base PPO, no k_nearest encoder | All 8 drones cluster — identical observations from same starting position produce identical actions |
+| v2 | + k_nearest encoder, + overlap penalty in reward | Still 100% identical actions — reward signal alone can't break the symmetry when observations are identical |
+| v3 | + drone index feature (5th unit feat), + sequential spatial masking | Drone index breaks input symmetry so the model *can* differentiate drones; masking guarantees they *must* pick different targets |
+
+The core insight: all drones start co-located at center with identical observations → identical logits → identical actions. This is a chicken-and-egg problem that soft incentives (reward penalties) cannot solve. The fix requires both (1) giving the model a way to distinguish drones (drone index) and (2) hard-constraining outputs so collisions are architecturally impossible (spatial masking).
+
+#### Inference (`rl_suppression.py`)
+
+`RLSuppressionAlgorithm` subclasses `SuppressionAlgorithm`, loads `param_dir/best_model.pt`, and uses `get_greedy_action_masked()` for deterministic action selection with spatial masking. Tracks `prev_burning` and `timestep` across calls. Reads `unit_features` from `params.json` for backward compatibility. Registered as `"rl"` in `SUPPRESSION_ALGORITHM_REGISTRY`.
+
+#### Gym Wrapper (`gym_wrapper.py`)
+
+`WildfireEnv` wraps `JurisdictionEnv` as a Gymnasium env. Handles reset/seed/episode tracking. Builds observations, translates actions, computes reward.
 
 ### `virtual_step` for planning
 
