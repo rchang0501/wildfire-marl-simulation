@@ -45,6 +45,7 @@ def collect_rollout(
         "grid": [],
         "units": [],
         "global_features": [],
+        "k_nearest": [],
         "actions": [],
         "log_probs": [],
         "rewards": [],
@@ -56,10 +57,11 @@ def collect_rollout(
         grid_t = torch.tensor(obs["grid"], dtype=torch.float32, device=device).unsqueeze(0)
         units_t = torch.tensor(obs["units"], dtype=torch.float32, device=device).unsqueeze(0)
         global_t = torch.tensor(obs["global_features"], dtype=torch.float32, device=device).unsqueeze(0)
+        kn_t = torch.tensor(obs["k_nearest"], dtype=torch.float32, device=device).unsqueeze(0)
 
         with torch.no_grad():
             action, log_prob, _, value = model.get_action_and_value(
-                grid_t, units_t, global_t
+                grid_t, units_t, global_t, k_nearest=kn_t
             )
 
         action_np = action.squeeze(0).cpu().numpy()
@@ -69,6 +71,7 @@ def collect_rollout(
         storage["grid"].append(obs["grid"])
         storage["units"].append(obs["units"])
         storage["global_features"].append(obs["global_features"])
+        storage["k_nearest"].append(obs["k_nearest"])
         storage["actions"].append(action_np)
         storage["log_probs"].append(log_prob.item())
         storage["rewards"].append(reward)
@@ -146,6 +149,7 @@ def ppo_update(
     grid_t = torch.tensor(rollout["grid"], dtype=torch.float32, device=device)
     units_t = torch.tensor(rollout["units"], dtype=torch.float32, device=device)
     global_t = torch.tensor(rollout["global_features"], dtype=torch.float32, device=device)
+    kn_t = torch.tensor(rollout["k_nearest"], dtype=torch.float32, device=device)
     actions_t = torch.tensor(rollout["actions"], dtype=torch.long, device=device)
     old_log_probs_t = torch.tensor(rollout["log_probs"], dtype=torch.float32, device=device)
     advantages_t = torch.tensor(advantages, dtype=torch.float32, device=device)
@@ -170,6 +174,7 @@ def ppo_update(
                 grid_t[mb_idx],
                 units_t[mb_idx],
                 global_t[mb_idx],
+                k_nearest=kn_t[mb_idx],
                 action=actions_t[mb_idx],
             )
 
@@ -230,6 +235,8 @@ def train(args: argparse.Namespace) -> None:
     model = WildfireActorCritic(
         num_units=args.num_units,
         k=K_NEAREST,
+        rows=args.rows,
+        cols=args.cols,
     ).to(device)
 
     optimizer = optim.Adam(model.parameters(), lr=args.lr, eps=1e-5)
@@ -262,7 +269,8 @@ def train(args: argparse.Namespace) -> None:
             grid_t = torch.tensor(obs["grid"], dtype=torch.float32, device=device).unsqueeze(0)
             units_t = torch.tensor(obs["units"], dtype=torch.float32, device=device).unsqueeze(0)
             global_t = torch.tensor(obs["global_features"], dtype=torch.float32, device=device).unsqueeze(0)
-            _, last_value = model(grid_t, units_t, global_t)
+            kn_t = torch.tensor(obs["k_nearest"], dtype=torch.float32, device=device).unsqueeze(0)
+            _, last_value = model(grid_t, units_t, global_t, k_nearest=kn_t)
             last_value = last_value.item()
 
         # Compute GAE
@@ -369,7 +377,7 @@ def main():
     parser.add_argument("--gae-lambda", type=float, default=0.95)
     parser.add_argument("--clip-eps", type=float, default=0.2)
     parser.add_argument("--value-coef", type=float, default=0.5)
-    parser.add_argument("--entropy-coef", type=float, default=0.01)
+    parser.add_argument("--entropy-coef", type=float, default=0.05)
     parser.add_argument("--max-grad-norm", type=float, default=0.5)
     parser.add_argument("--num-epochs", type=int, default=4)
     parser.add_argument("--minibatch-size", type=int, default=64)

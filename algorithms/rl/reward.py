@@ -35,4 +35,10 @@ def compute_reward(
     # Bonus: reward successful suppression
     reward += 0.5 * extinguished / total_cells
 
+    # Overlap penalty: discourage multiple drones on the same cell
+    if jenv.num_units > 0:
+        counts = jenv.units_per_cell()
+        overlap = float(np.sum(np.maximum(counts - 1, 0)))
+        reward -= 0.1 * overlap / jenv.num_units
+
     return reward

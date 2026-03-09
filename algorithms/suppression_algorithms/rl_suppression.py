@@ -32,10 +32,14 @@ class RLSuppressionAlgorithm(SuppressionAlgorithm):
         # Model parameters from params.json
         num_units = self.params.get("num_units", 8)
         k = self.params.get("k", K_NEAREST)
+        rows = self.params.get("rows", 16)
+        cols = self.params.get("cols", 16)
         model_file = self.params.get("model_file", "best_model.pt")
 
         # Build model
-        self._model = WildfireActorCritic(num_units=num_units, k=k).to(self._device)
+        self._model = WildfireActorCritic(
+            num_units=num_units, k=k, rows=rows, cols=cols
+        ).to(self._device)
 
         # Load weights if param_dir provided
         if self.param_dir:
@@ -76,10 +80,11 @@ class RLSuppressionAlgorithm(SuppressionAlgorithm):
         grid_t = torch.tensor(obs["grid"], dtype=torch.float32, device=self._device).unsqueeze(0)
         units_t = torch.tensor(obs["units"], dtype=torch.float32, device=self._device).unsqueeze(0)
         global_t = torch.tensor(obs["global_features"], dtype=torch.float32, device=self._device).unsqueeze(0)
+        kn_t = torch.tensor(obs["k_nearest"], dtype=torch.float32, device=self._device).unsqueeze(0)
 
         # Get action from policy (deterministic at inference — use argmax)
         with torch.no_grad():
-            logits, _ = self._model(grid_t, units_t, global_t)
+            logits, _ = self._model(grid_t, units_t, global_t, k_nearest=kn_t)
             agent_actions = logits.argmax(dim=-1).squeeze(0).cpu().numpy()
 
         # Translate to (dx, dy)
