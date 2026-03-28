@@ -437,11 +437,15 @@ def animate_snapshot_file(snapshot_file: Path, out_file: Path, fps: float = 2.0)
 def main():
     parser = argparse.ArgumentParser(description="Animate from saved snapshot files.")
     parser.add_argument("--snapshots-dir", default="snapshots", help="Directory containing .npz snapshot files.")
+    parser.add_argument("--snapshot", default=None, help="Animate a single .npz file instead of the whole directory.")
     parser.add_argument("--output-dir", default="animations", help="Directory for output animations.")
     parser.add_argument("--fps", type=float, default=2.0, help="Frames per second.")
     args = parser.parse_args()
 
-    files = load_snapshot_files(args.snapshots_dir)
+    if args.snapshot:
+        files = [Path(args.snapshot)]
+    else:
+        files = load_snapshot_files(args.snapshots_dir)
     out_dir = Path(args.output_dir)
 
     for snapshot_file in files:

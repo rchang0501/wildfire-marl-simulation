@@ -14,7 +14,12 @@ Each jurisdiction is a 2D grid of cells. At each timestep, three things happen t
 
 ### Suppression Units
 
-Units live on the grid and move each step by a `(dx, dy)` offset, clamped to grid bounds and limited by `movement_per_step` (Manhattan distance). The **suppression algorithm** decides where each unit moves. The current implementation is a greedy heuristic: each unit targets the nearest burning cell, claims it so other units pick different targets, and moves toward it. Idle units drift back toward the grid center.
+Units live on the grid and move each step by a `(dx, dy)` offset, clamped to grid bounds and limited by `movement_per_step` (Manhattan distance). The **suppression algorithm** decides where each unit moves. Three algorithms are available:
+
+- **`greedy`** — Each unit targets the nearest burning cell, claims it so other units pick different targets, and moves toward it. Idle units drift toward center.
+- **`lp_suppression`** — Optimal unit-to-fire assignment via linear programming (minimizes total Manhattan distance).
+- **`rl`** — Learned policy via PPO (see [RL Architecture](#rl-architecture)). A CNN+MLP actor-critic observes the full grid state, per-drone features (including drone index), and global scalars, then selects from each drone's K=10 nearest fires using sequential spatial masking to prevent drones from targeting the same cell. Requires a trained model (see [RL Training](#rl-training)).
+- **`marl`** — Multi-agent attention-based policy via MAPPO (see [MARL Architecture](#marl-architecture)). Uses self-attention for inter-drone communication, is N-agnostic (handles any drone count without retraining), and trains with variable drone counts per episode. Requires a trained model (see [MARL Training](#marl-training)).
 
 ### Fuel System (Optional)
 
@@ -53,7 +58,22 @@ wildfire-marl-simulation/
 │   ├── suppression_algorithms/
 │   │   ├── __init__.py                 # SUPPRESSION_ALGORITHM_REGISTRY
 │   │   ├── algorithm_base.py           # SuppressionAlgorithm ABC
-│   │   └── greedy.py                   # greedy nearest-fire heuristic
+│   │   ├── greedy.py                   # greedy nearest-fire heuristic
+│   │   ├── lp_suppression.py           # LP-based optimal assignment
+│   │   ├── rl_suppression.py           # RL inference wrapper (loads trained PPO model)
+│   │   └── marl_suppression.py         # MARL inference wrapper (loads trained attention model)
+│   ├── rl/                             # RL training module (fixed N)
+│   │   ├── observation.py              # state space: grid channels, unit/global features, K-nearest
+│   │   ├── action_translation.py       # action space: K-nearest fire selection → (dx,dy)
+│   │   ├── reward.py                   # reward: -burning/total + 0.5*extinguished/total
+│   │   ├── network.py                  # WildfireActorCritic (CNN + MLP, per-drone policy heads)
+│   │   ├── gym_wrapper.py              # Gymnasium env wrapping JurisdictionEnv
+│   │   └── train.py                    # PPO training script (python -m algorithms.rl.train)
+│   ├── marl/                           # MARL training module (variable N, attention)
+│   │   ├── observation.py              # state space: 4 global features, active_mask, optional padding
+│   │   ├── network.py                  # WildfireActorCritic (attention-based, N-agnostic)
+│   │   ├── gym_wrapper.py              # Gymnasium env with variable drone count per episode
+│   │   └── train.py                    # MAPPO training script (python -m algorithms.marl.train)
 │   └── sharing_algorithms/
 │       ├── __init__.py                 # SHARING_ALGORITHM_REGISTRY
 │       ├── algorithm_base.py           # SharingAlgorithm ABC
@@ -77,7 +97,7 @@ conda activate sim-wildfire-marl
 Or install dependencies manually:
 
 ```bash
-pip install numpy matplotlib pillow
+pip install -r requirements.txt
 ```
 
 ## Running the Simulation
@@ -123,6 +143,63 @@ python main.py --mode multi --sharing-algorithm periodic_transfer --save-snapsho
 python fire_animator.py --snapshots-dir snapshots --output-dir animations --fps 4
 ```
 
+### RL Training
+
+Train a PPO suppression agent, then evaluate it alongside baselines:
+
+```bash
+# Train (saves to trained_models/rl_v3/)
+python -m algorithms.rl.train --total-timesteps 500000 --output-dir trained_models/rl_v3
+
+# Resume from latest checkpoint (if training was interrupted)
+python -m algorithms.rl.train --total-timesteps 500000 --output-dir trained_models/rl_v3 --resume
+
+# Evaluate trained model in single mode
+python main.py --mode single --suppression-algorithm rl --suppression-param-dir trained_models/rl_v3 --verbose --steps 200 --save-snapshots --output-dir results
+
+# Generate animation from saved snapshots
+python fire_animator.py --snapshots-dir results --output-dir animations --fps 2.0
+
+# Compare against baselines
+python compare.py --suppression greedy lp_suppression rl --sharing none --suppression-param-dir trained_models/rl_v3 --num-seeds 5 --steps 200 --label rl_v3_comparison --verbose
+```
+
+Key training flags: `--lr` (default 3e-4), `--rollout-steps` (default 2048), `--num-epochs` (default 4), `--gamma` (default 0.99), `--episode-steps` (default 200), `--seed`, `--max-fuel`. The training script saves `best_model.pt`, `final_model.pt`, periodic checkpoints (with optimizer state for resumability), and `params.json` for inference.
+
+### MARL Training
+
+Train a MAPPO suppression agent with attention-based inter-drone communication and variable drone counts:
+
+```bash
+# Train (saves to trained_models/marl_v1/)
+python -m algorithms.marl.train --total-timesteps 500000 --output-dir trained_models/marl_v1
+
+# Resume from latest checkpoint
+python -m algorithms.marl.train --total-timesteps 500000 --output-dir trained_models/marl_v1 --resume
+
+# Custom drone count range
+python -m algorithms.marl.train --min-units 4 --max-units 12 --output-dir trained_models/marl_v1
+
+# Evaluate trained model
+python main.py --mode single --suppression-algorithm marl --suppression-param-dir trained_models/marl_v1 --verbose --save-snapshots --output-dir snapshots --run-label marl_v1
+
+# Multi-jurisdiction inference
+python main.py --mode multi --suppression-algorithm marl --suppression-param-dir trained_models/marl_v1 --sharing-algorithm periodic_transfer --save-snapshots --output-dir snapshots --run-label marl_v1_multi
+
+# Animate
+python fire_animator.py --snapshot snapshots/marl_v1__mode_single__suppression_marl.npz --output-dir animations --fps 4
+```
+
+Key MARL-specific flags: `--max-units` (default 12), `--min-units` (default 4). The model is N-agnostic at inference — it handles any drone count without retraining. Note: `--suppression-param-dir` is shared across all algorithms in `compare.py`, so run RL and MARL comparisons separately:
+
+```bash
+# Compare MARL against non-learned baselines
+python compare.py --suppression greedy lp_suppression marl --sharing none --suppression-param-dir trained_models/marl_v1
+
+# Compare RL against non-learned baselines (separate run)
+python compare.py --suppression greedy lp_suppression rl --sharing none --suppression-param-dir trained_models/rl_v3
+```
+
 ### Comparing Algorithms
 
 `compare.py` runs the cartesian product of suppression x sharing algorithms across multiple random seeds, collects per-step metrics, computes summary statistics, and generates comparison plots.
@@ -133,6 +210,9 @@ python compare.py
 
 # Specific algorithms and more seeds
 python compare.py --suppression greedy lp_suppression --sharing none periodic_transfer --seeds 0 1 2 3 4 5 6 7 8 9
+
+# Include RL (requires --suppression-param-dir pointing to trained model)
+python compare.py --suppression greedy lp_suppression rl --sharing none --suppression-param-dir trained_models/rl_v3 --num-seeds 5
 
 # Quick test (fewer steps and seeds)
 python compare.py --steps 50 --num-seeds 3
@@ -222,6 +302,180 @@ This section provides the technical context needed to extend this codebase.
 4. `get_steering_actions` returns `{unit_id: (dx, dy)}` to override suppression actions for specific units (e.g., to walk them toward center before transfer).
 5. Register in `algorithms/sharing_algorithms/__init__.py`.
 6. Useful `multi_env` attributes: `jurisdictions` (list of `JurisdictionEnv`), `unit_jurisdiction`, `unit_local_index`, `burning_counts`, `juris_row`, `juris_col`, `adj_matrix`, `num_juris_rows`, `num_juris_cols`, `transit_units`.
+
+### RL Architecture
+
+The RL module (`algorithms/rl/`) implements a centralized PPO agent for single-jurisdiction suppression. The architecture has gone through three iterations to solve a drone clustering problem.
+
+#### State Space (`observation.py`)
+
+Dict observation with 4 components:
+- `grid` — `(4, 16, 16)` float32: burning map, spread probabilities, units-per-cell, recently extinguished.
+- `units` — `(8, 5)` float32: normalized row, col, fuel, must_return, **drone index** (`i/(N-1)`, range [0,1]).
+- `global_features` — `(3,)` float32: burning fraction, time progress, delta burning.
+- `k_nearest` — `(8, 10, 2)` int: row/col of K=10 nearest fires per drone (padded with center cell).
+
+#### Action Space (`action_translation.py`)
+
+`MultiDiscrete([11]*8)` — each drone selects one of K=10 nearest fires or idle (index 10). Translated to `(dx, dy)` via `step_toward()`. Drones with `must_return_to_base=True` are overridden to return to center.
+
+#### Reward (`reward.py`)
+
+`-burning_after/total_cells + 0.5 * extinguished/total_cells`. Range ~[-1, 0.5]. Dense, aligned with minimizing cumulative fire. Includes an overlap penalty for drones stacking on the same cell.
+
+#### Network (`network.py`)
+
+`WildfireActorCritic` processes observations through four parallel encoders, combines them, then produces per-drone policy logits and a state value:
+
+```
+Grid (4,16,16) ──► GridEncoder (Conv3x3→32→Conv3x3→64→AvgPool→FC128) ──► (128,)
+                                                                             │
+Units (8,5) ──► UnitEncoder (shared MLP: 5→32→32) ──► per_unit (8,32)      │
+                       │                                    │                │
+                       ├── mean-pool ──► unit_summary (32,) ─┤               │
+                       │                                     │               │
+Global (3,) ──► GlobalEncoder (MLP: 3→16) ──► (16,) ────────┘               │
+                                                             │               │
+                                              cat [128, 32, 16] = (176,)    │
+                                                             │               │
+                                              SharedMLP (176→128→128) ──► shared (128,)
+                                                             │
+                    ┌────────────────────────────────────────┤
+                    │                                        │
+             ┌──────┴──────┐                          ValueHead (128→64→1)
+             │  Per-drone  │
+             │  Policy     │
+             └──────┬──────┘
+                    │
+    For each drone i:
+      cat [shared(128), unit_embed_i(32), kn_embed_i(32)] = (192,)
+         │
+      PolicyHead (192→64→11) ──► logits_i
+```
+
+The K-Nearest Encoder converts absolute fire coords to relative coords `(fire - drone) / grid_size`, flattens K*2=20 floats, and processes through MLP (20→32→32).
+
+#### Sequential Spatial Masking
+
+The key architectural innovation that prevents drone clustering. `forward()` produces raw `(B, N, 11)` logits in one pass. Then `get_action_and_value()` samples actions sequentially:
+
+1. For each drone `i` in order `0..N-1`:
+   - Clone drone `i`'s logits
+   - For each fire action `a` in `0..K-1`: resolve the spatial cell from `k_nearest[i, a]`. If that cell is already claimed by a previous drone, set the logit to `-inf`
+   - Idle (index K=10) is **never masked** — always available as fallback
+   - Sample from the masked distribution (training) or argmax (inference via `get_greedy_action_masked()`)
+   - Claim the chosen cell
+2. Claimed cells tracked via `(B, rows*cols)` bool tensor — negligible overhead
+
+This is **cell-based masking**, not action-index-based: drone 1's action 3 and drone 2's action 5 may target the same physical cell, and the masking catches this. The masking is PPO-consistent — during the eval pass, the same sequential order with stored actions reconstructs correct log probabilities.
+
+#### Design History
+
+| Version | Key Changes | Outcome |
+|---------|------------|---------|
+| v1 | Base PPO, no k_nearest encoder | All 8 drones cluster — identical observations from same starting position produce identical actions |
+| v2 | + k_nearest encoder, + overlap penalty in reward | Still 100% identical actions — reward signal alone can't break the symmetry when observations are identical |
+| v3 | + drone index feature (5th unit feat), + sequential spatial masking | Drone index breaks input symmetry so the model *can* differentiate drones; masking guarantees they *must* pick different targets |
+
+The core insight: all drones start co-located at center with identical observations → identical logits → identical actions. This is a chicken-and-egg problem that soft incentives (reward penalties) cannot solve. The fix requires both (1) giving the model a way to distinguish drones (drone index) and (2) hard-constraining outputs so collisions are architecturally impossible (spatial masking).
+
+#### Inference (`rl_suppression.py`)
+
+`RLSuppressionAlgorithm` subclasses `SuppressionAlgorithm`, loads `param_dir/best_model.pt`, and uses `get_greedy_action_masked()` for deterministic action selection with spatial masking. Tracks `prev_burning` and `timestep` across calls. Reads `unit_features` from `params.json` for backward compatibility. Registered as `"rl"` in `SUPPRESSION_ALGORITHM_REGISTRY`.
+
+#### Gym Wrapper (`gym_wrapper.py`)
+
+`WildfireEnv` wraps `JurisdictionEnv` as a Gymnasium env. Handles reset/seed/episode tracking. Builds observations, translates actions, computes reward.
+
+### MARL Architecture
+
+The MARL module (`algorithms/marl/`) is a separate implementation from RL with a fundamentally different design: it uses **self-attention** for inter-drone communication (MAPPO-style centralized training, decentralized execution) and is **fully N-agnostic** — the model has no stored drone count and handles any number of drones at inference without retraining. Training uses variable drone counts per episode to learn this generalization.
+
+#### Relationship to RL Module
+
+MARL is independent of the RL module. It copies the four encoder classes (`GridEncoder`, `UnitEncoder`, `KNearestEncoder`, `GlobalEncoder`) into its own `network.py` to avoid import coupling. It reuses `algorithms/rl/action_translation.py` and `algorithms/rl/reward.py` (action space and reward are unchanged).
+
+Key differences from RL:
+
+| Aspect | RL (`algorithms/rl/`) | MARL (`algorithms/marl/`) |
+|--------|----------------------|--------------------------|
+| Drone count | Fixed N=8, baked into model | N-agnostic, derived from input tensor shape |
+| Training N | Always 8 | Sampled from `Uniform[min_units, max_units]` per episode |
+| Inter-drone comm | None (mean-pool summary only) | 4-head self-attention |
+| Global features | 3 (burning frac, time, delta) | 4 (+ active drone ratio `n/max_units`) |
+| Per-drone policy | `cat(shared, unit_embed, kn_embed)` → MLP | Attention output → MLP (batched, no for-loop) |
+| Value function | From shared MLP (mean-pooled units) | Masked mean-pool of attended drone reprs |
+| Observation padding | None | Pads to `max_units` with `active_mask` during training |
+
+#### State Space (`observation.py`)
+
+Dict observation with 5 components (during training; 4 at inference):
+
+- `grid` — `(4, 16, 16)` float32: same as RL (burning, spread probs, unit density, recently extinguished).
+- `units` — `(N, 5)` or `(max_units, 5)` float32: same features as RL (normalized row, col, fuel, must_return, drone index). Padded with zeros to `max_units` during training.
+- `global_features` — `(4,)` float32: burning fraction, time progress, delta burning, **active drone ratio** (`n/max_units`). The 4th feature tells the model what fraction of the padded slots are real drones.
+- `k_nearest` — `(N, 10, 2)` or `(max_units, 10, 2)` int: same as RL. Padded slots filled with center cell coordinates.
+- `active_mask` — `(max_units,)` bool: `True` for real drones, `False` for padding. Only present during training (`max_units != None`).
+
+At inference (`max_units=None`), observations use raw shapes `(N, ...)` with no padding and no mask.
+
+#### Network (`network.py`)
+
+```
+Per drone i:
+  cat [grid_embed(128), unit_embed_i(32), kn_embed_i(32), global_embed(16)] = (208,)
+    │
+  DroneProjection (Linear 208→128, ReLU) ──► drone_repr (B, N, 128)
+    │
+  DroneAttention (4-head MHA, pre-LN residual) ──► attended (B, N, 128)
+    │
+    ├──► PolicyHead (128→64→11) per drone ──► logits (B, N, 11)  [batched, no for-loop]
+    └──► masked mean-pool ──► ValueHead (128→64→1) ──► value (B, 1)  [centralized]
+```
+
+**N-agnostic design:** The constructor takes no `num_units` or `max_units`. All layers (encoders, projection, attention, heads) operate on arbitrary sequence lengths. N is derived from `units.shape[1]` at runtime.
+
+**DroneAttention:** Single-layer pre-LN multi-head self-attention. `output = x + MHA(LN(x))`. Uses PyTorch's `nn.MultiheadAttention` with `batch_first=True`. The `key_padding_mask` excludes padding drones from attention (set to `True` for positions to ignore). This allows real drones to attend only to other real drones, regardless of padding.
+
+**Policy head:** Applied to all N drone representations in a single batched `Linear` call (no per-drone for-loop in the forward pass). The for-loop only appears in sequential spatial masking during action selection.
+
+**Value head:** Masked mean-pool of attended representations (excludes padding drones), then MLP. This is a centralized value function — it sees all drones' attended representations, which encode inter-drone communication via attention.
+
+**Parameter count:** ~141K parameters (vs RL's ~145K). The attention layer replaces RL's shared MLP at similar cost.
+
+#### Sequential Spatial Masking with Active Mask
+
+Same cell-based masking as RL, extended with `active_mask` handling:
+
+1. For each drone `i` in order `0..N-1`:
+   - If `active_mask[i] = False` (padding drone): set all fire logits to `-inf`, forcing idle. Skip log_prob/entropy accumulation and cell claiming.
+   - Otherwise: apply claimed-cell masking identically to RL.
+2. Log probabilities and entropy are only summed over active drones — inactive drones contribute zero, preventing padding from corrupting the policy gradient.
+
+#### Training (`train.py`, `gym_wrapper.py`)
+
+**Variable drone count:** On each `reset()`, the gym wrapper samples `n ~ Uniform[min_units, max_units]` and creates a `JurisdictionEnv` with that N. Observations are padded to `max_units` with `active_mask` indicating real vs padding drones. Actions from the policy for padding drones are sliced off before passing to the environment.
+
+**PPO update:** Identical to RL except `active_mask` is stored in the rollout buffer and passed to `get_action_and_value()` during both collection and minibatch evaluation.
+
+**`params.json`** saved at training end:
+```json
+{
+  "k": 10,
+  "rows": 16,
+  "cols": 16,
+  "unit_features": 5,
+  "global_features": 4,
+  "architecture": "attention",
+  "model_file": "best_model.pt"
+}
+```
+
+The `architecture` field distinguishes MARL from RL models. The absence of `num_units` reflects the N-agnostic design.
+
+#### Inference (`marl_suppression.py`)
+
+`MARLSuppressionAlgorithm` builds observations with `max_units=None` (no padding, no mask). All drones are real at inference. Uses `get_greedy_action_masked()` with raw `(1, N, ...)` tensors. Handles `n=0` by returning `(0, 2)` empty array. Registered as `"marl"` in `SUPPRESSION_ALGORITHM_REGISTRY`.
 
 ### `virtual_step` for planning
 

@@ -8,3 +8,5 @@ dependencies:
   - scipy
   - pip:
     - pillow
+    - torch
+    - gymnasium

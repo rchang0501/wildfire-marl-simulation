@@ -131,6 +131,7 @@ def run_comparison(
     period_s: int | None,
     env_params: dict,
     verbose: bool,
+    suppression_param_dir: str = "",
 ) -> dict:
     """Run all algorithm combos x seeds and return structured results."""
     combos = list(product(suppression_names, sharing_names))
@@ -166,7 +167,7 @@ def run_comparison(
                 sharing_algorithm_name=share_name,
                 suppression_algorithm_name=supp_name,
                 sharing_param_dir="",
-                suppression_param_dir="",
+                suppression_param_dir=suppression_param_dir,
                 sharing_params=sharing_params,
                 suppression_params={},
                 steps=steps,
@@ -341,6 +342,10 @@ def main():
     parser.add_argument("--max-fuel", type=int, default=None, help="Max fuel per unit (None = unlimited).")
     parser.add_argument("--fuel-refuel-rate", type=int, default=1, help="Fuel gained per step at base.")
 
+    # Algorithm param dirs
+    parser.add_argument("--suppression-param-dir", default="",
+                        help="Param directory for suppression algorithm (e.g. trained_models/rl_v3 for rl).")
+
     # Output
     parser.add_argument("--output-dir", default="comparisons")
     parser.add_argument("--label", default="comparison")
@@ -393,6 +398,7 @@ def main():
         period_s=args.period_s,
         env_params=env_params,
         verbose=args.verbose,
+        suppression_param_dir=args.suppression_param_dir,
     )
 
     save_results(results, output_dir)
