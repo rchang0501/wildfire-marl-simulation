@@ -1,0 +1,9 @@
+{
+  "k": 10,
+  "rows": 16,
+  "cols": 16,
+  "unit_features": 5,
+  "global_features": 4,
+  "architecture": "attention",
+  "model_file": "best_model.pt"
+}
